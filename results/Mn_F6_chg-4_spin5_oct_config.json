@@ -1,0 +1,16 @@
+{
+  "metal": "Mn",
+  "ligand": "F",
+  "charge": -4,
+  "spin_2s": 5,
+  "geometry": "oct",
+  "n_ligands": 6,
+  "dist_ang": 1.98,
+  "M": 100,
+  "sweeps": 30,
+  "window_size": 26,
+  "spin_cat": "high",
+  "_time": "08:00:00",
+  "_mem": "48G",
+  "name": "Mn_F6_chg-4_spin5_oct"
+}

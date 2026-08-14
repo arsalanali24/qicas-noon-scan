@@ -1,0 +1,16 @@
+{
+  "metal": "Mn",
+  "ligand": "O",
+  "charge": -2,
+  "spin_2s": 5,
+  "geometry": "tet",
+  "n_ligands": 4,
+  "dist_ang": 2.1,
+  "M": 100,
+  "sweeps": 30,
+  "window_size": 26,
+  "spin_cat": "high",
+  "_time": "08:00:00",
+  "_mem": "48G",
+  "name": "Mn_O4_chg-2_spin5_tet"
+}

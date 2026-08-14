@@ -1,0 +1,16 @@
+{
+  "metal": "Mn",
+  "ligand": "Br",
+  "charge": -2,
+  "spin_2s": 1,
+  "geometry": "tet",
+  "dist_ang": 2.5,
+  "n_ligands": 4,
+  "M": 100,
+  "sweeps": 35,
+  "window_size": 22,
+  "spin_cat": "low",
+  "_time": "06:00:00",
+  "_mem": "32G",
+  "name": "Mn_Br4_chg-2_spin1_tet"
+}
