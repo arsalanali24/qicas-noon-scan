@@ -292,7 +292,7 @@ def list_completed():
 
     for d in sorted(RESULTS.iterdir()):
         if not d.is_dir(): continue
-        has_plot  = (d / "noon_convergence.png").exists()
+        has_plot  = any(d.glob("*.png"))
         has_scan  = (d / "scan_results.json").exists()
         has_qicas = (d / "qicas_result.json").exists()
 
