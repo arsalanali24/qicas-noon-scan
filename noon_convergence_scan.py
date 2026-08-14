@@ -211,9 +211,17 @@ def run_uhf(mol, scf):
 
 def select_window(mf, s, scf):
     """Frontier orbital window — mirrors qicas_canonical.py exactly."""
-    n_mo = mf.mo_coeff[0].shape[1]
-    n_a  = int(mf.mo_occ[0].sum())
-    n_b  = int(mf.mo_occ[1].sum())
+    # Handle both RHF (singlet) and UHF
+    if hasattr(mf.mo_coeff[0], 'shape') and mf.mo_coeff[0].ndim == 1:
+        # RHF: mo_coeff is 2D array, mo_occ is 1D
+        n_mo = mf.mo_coeff.shape[1]
+        n_a  = int((mf.mo_occ > 0).sum())
+        n_b  = int((mf.mo_occ > 1).sum())
+    else:
+        # UHF: mo_coeff is (2, nao, nmo)
+        n_mo = mf.mo_coeff[0].shape[1]
+        n_a  = int(mf.mo_occ[0].sum())
+        n_b  = int(mf.mo_occ[1].sum())
     win  = 26 if s["spin_2s"] >= 4 else (24 if s["spin_2s"] >= 2 else 22)
     half = win // 2
     start = max(0, n_a - half)
