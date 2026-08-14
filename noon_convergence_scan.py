@@ -212,8 +212,8 @@ def run_uhf(mol, scf):
 def select_window(mf, s, scf):
     """Frontier orbital window — mirrors qicas_canonical.py exactly."""
     # Handle both RHF (singlet) and UHF
-    if hasattr(mf.mo_coeff[0], 'shape') and mf.mo_coeff[0].ndim == 1:
-        # RHF: mo_coeff is 2D array, mo_occ is 1D
+    if s["spin_2s"] == 0:
+        # RHF: mo_coeff is (nao, nmo), mo_occ is (nmo,)
         n_mo = mf.mo_coeff.shape[1]
         n_a  = int((mf.mo_occ > 0).sum())
         n_b  = int((mf.mo_occ > 1).sum())
@@ -277,19 +277,28 @@ def run_qicas(name, s, out_json="qicas_result.json",
 
     # ── Step 4: DMRG on window ───────────────────────────────────────────────
     print(f"\n[Step 4] DMRG  M={M}, sweeps={nsweeps} ...")
-    occ   = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
+    # Handle RHF (singlet) vs UHF
+    if mol.spin == 0:
+        occ = mf.mo_occ / 2.0   # RHF: mo_occ counts electrons per orbital (0 or 2)
+    else:
+        occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0  # UHF: alpha + beta
     n_e   = int(round(2 * occ[window].sum()))
     if (n_e - mol.spin) % 2 != 0: n_e += 1
     if (n_e - mol.spin) % 2 != 0: n_e -= 2
     n_e   = int(np.clip(n_e, mol.spin, 2 * n_win))
 
-    n_mo    = mf.mo_coeff[0].shape[1]
+    # Handle RHF vs UHF mo_coeff
+    if mol.spin == 0:
+        mo_alpha = mf.mo_coeff          # RHF: (nao, nmo)
+    else:
+        mo_alpha = mf.mo_coeff[0]       # UHF: alpha spin (nao, nmo)
+    n_mo    = mo_alpha.shape[1]
     all_i   = list(range(n_mo))
     core    = sorted([i for i in all_i if i not in window and occ[i] > 1.5])
     virt    = sorted([i for i in all_i if i not in window and occ[i] < 0.5])
     other   = sorted([i for i in all_i if i not in window
                        and i not in core and i not in virt])
-    mo_ord  = mf.mo_coeff[0][:, core + window + other + virt]
+    mo_ord  = mo_alpha[:, core + window + other + virt]
 
     mc_dmrg = mcscf.CASSCF(mf.to_rhf(), n_win, n_e)
     mc_dmrg.fcisolver = dmrgci.DMRGCI(mol, maxM=M, tol=1e-8)
@@ -417,7 +426,11 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
     occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
 
     # Reconstruct the MO coefficient matrix in QICAS ordering
-    mo_alpha   = mf.mo_coeff[0]
+    # Handle RHF vs UHF
+    if mol.spin == 0:
+        mo_alpha = mf.mo_coeff
+    else:
+        mo_alpha = mf.mo_coeff[0]
     mo_ordered = mo_alpha[:, mo_order_abs]   # shape (nao, n_mo)
 
     # Relative indices of window within mo_ordered
