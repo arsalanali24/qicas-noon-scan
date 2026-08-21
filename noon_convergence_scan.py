@@ -69,7 +69,7 @@ for _p in [_HERE, os.path.join(_HERE, "..")]:
 # ── PySCF imports (only needed for phases 1 & 2) ─────────────────────────────
 def _import_pyscf():
     try:
-        from pyscf import gto, scf, mcscf
+        from pyscf import gto, scf, mcscf, dft
         from pyscf.dmrgscf import dmrgci
         return gto, scf, mcscf, dmrgci
     except ImportError as e:
@@ -125,11 +125,11 @@ SYSTEMS = {
                                     charge=-2, metal_row="3d", needs_ecp=False,
                                     ref_no=12, ref_ne=19),
     "MnBr4_chg-2_spin5_tet":  dict(spin_2s=5, metal="Mn", ligand_raw="Br",
-                                    n_ligands=4, geometry="tet", dist_ang=2.50,
+                                    n_ligands=4, geometry="tet", dist_ang=2.63,
                                     charge=-2, metal_row="3d", needs_ecp=False,
                                     ref_no=12, ref_ne=19),
     "MnBr4_chg-2_spin3_tet":  dict(spin_2s=3, metal="Mn", ligand_raw="Br",
-                                    n_ligands=4, geometry="tet", dist_ang=2.50,
+                                    n_ligands=4, geometry="tet", dist_ang=2.63,
                                     charge=-2, metal_row="3d", needs_ecp=False,
                                     ref_no=12, ref_ne=19),
 
@@ -146,7 +146,7 @@ SYSTEMS = {
                                     charge=-2, metal_row="3d", needs_ecp=False,
                                     ref_no=3,  ref_ne=4),
     "MnBr4_chg-1_spin0_tet":  dict(spin_2s=0, metal="Mn", ligand_raw="Br",
-                                    n_ligands=4, geometry="tet", dist_ang=2.50,
+                                    n_ligands=4, geometry="tet", dist_ang=2.63,
                                     charge=-1, metal_row="3d", needs_ecp=False,
                                     ref_no=13, ref_ne=18),
     "Ti_Cl6_chg0_spin4_oct_d2p115":  dict(spin_2s=4, metal="Ti", ligand_raw="Cl",
@@ -186,13 +186,16 @@ def build_mol(name, s, gto):
     return mol
 
 
-def run_uhf(mol, scf):
-    """UHF with multiple fallback strategies."""
-    if mol.spin == 0:
-        mf = scf.RHF(mol)
-        print("  [HF] Using RHF (singlet)")
+def run_uhf(mol, scf, s):
+    """DFT/PBE0 with multiple fallback strategies."""
+    if s["spin_2s"] == 0:
+        mf = dft.RKS(mol)
+        mf.xc = 'pbe0'
+        print("  [DFT] Using RKS/PBE0 (singlet)")
     else:
-        mf = scf.UHF(mol)
+        mf = dft.UKS(mol)
+        mf.xc = 'pbe0'
+        print("  [DFT] Using UKS/PBE0")
     mf.max_cycle = 500
     mf.conv_tol  = 1e-10
     for init, ls, damp in [("atom", 0.2, 0.0),
@@ -213,12 +216,12 @@ def select_window(mf, s, scf):
     """Frontier orbital window — mirrors qicas_canonical.py exactly."""
     # Handle both RHF (singlet) and UHF
     if s["spin_2s"] == 0:
-        # RHF: mo_coeff is (nao, nmo), mo_occ is (nmo,)
+        # RKS: mo_coeff is (nao, nmo), mo_occ is (nmo,)
         n_mo = mf.mo_coeff.shape[1]
         n_a  = int((mf.mo_occ > 0).sum())
         n_b  = int((mf.mo_occ > 1).sum())
     else:
-        # UHF: mo_coeff is (2, nao, nmo)
+        # UKS: mo_coeff is (2, nao, nmo)
         n_mo = mf.mo_coeff[0].shape[1]
         n_a  = int(mf.mo_occ[0].sum())
         n_b  = int(mf.mo_occ[1].sum())
@@ -267,7 +270,7 @@ def run_qicas(name, s, out_json="qicas_result.json",
     # ── Step 2: UHF ──────────────────────────────────────────────────────────
     print("\n[Step 2] UHF ...")
     t0 = time.time()
-    mf = run_uhf(mol, scf)
+    mf = run_uhf(mol, scf, s)
     print(f"  E(UHF) = {mf.e_tot:.8f}  ({time.time()-t0:.1f}s)")
 
     # ── Step 3: Orbital window ────────────────────────────────────────────────
@@ -300,7 +303,7 @@ def run_qicas(name, s, out_json="qicas_result.json",
                        and i not in core and i not in virt])
     mo_ord  = mo_alpha[:, core + window + other + virt]
 
-    mc_dmrg = mcscf.CASSCF(mf.to_rhf(), n_win, n_e)
+    mc_dmrg = mcscf.CASSCF(mf, n_win, n_e)
     mc_dmrg.fcisolver = dmrgci.DMRGCI(mol, maxM=M, tol=1e-8)
     mc_dmrg.fcisolver.scratchDirectory  = scratch
     mc_dmrg.fcisolver.runtimeDir        = scratch
@@ -385,7 +388,7 @@ def run_qicas(name, s, out_json="qicas_result.json",
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
-                    n_below=4, n_above=2, scratch="/tmp/noon_scan"):
+                    n_below=4, n_above=2, scratch="/tmp/noon_scan", max_orbs=16):
     """
     Run CASSCF at nested active space sizes centred on QICAS recommendation.
 
@@ -412,7 +415,7 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
     # Scan range
     n_min = max(int(math.ceil(n_elec_fixed / 2)), n_qicas - n_below, 2)
     n_max = n_qicas + n_above
-    scan_sizes = list(range(n_min, n_max + 1))
+    scan_sizes = [n for n in range(n_min, n_max + 1) if n <= max_orbs]
     print(f"\n{'='*60}")
     print(f"  Phase 2 — CASSCF scan on {name}")
     print(f"  QICAS recommendation: CAS({n_elec_fixed}, {n_qicas})")
@@ -422,7 +425,7 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
     # Rebuild molecule and UHF (needed for CASSCF)
     print("\n[Rebuild mol + UHF for CASSCF] ...")
     mol = build_mol(name, s, gto)
-    mf  = run_uhf(mol, scf)
+    mf  = run_uhf(mol, scf, s)
     occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
 
     # Reconstruct the MO coefficient matrix in QICAS ordering
@@ -431,6 +434,7 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
         mo_alpha = mf.mo_coeff
     else:
         mo_alpha = mf.mo_coeff[0]
+    n_mo_scan  = mo_alpha.shape[1]
     mo_ordered = mo_alpha[:, mo_order_abs]   # shape (nao, n_mo)
 
     # Relative indices of window within mo_ordered
@@ -469,10 +473,12 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
 
         # Run CASSCF
         t0  = time.time()
-        mc  = mcscf.CASSCF(mf.to_rhf(), n_orb, n_elec_fixed)
+        mc  = mcscf.CASSCF(mf, n_orb, n_elec_fixed)
         mc.max_cycle_macro = 1
         mc.conv_tol        = 1e-8
         mc.verbose         = 3
+        target_ss = spin_2s * (spin_2s + 2) / 4.0
+        mc.fix_spin_(ss=target_ss, shift=0.5)
         # Enforce correct spin state — prevents AutoCAS-style spin collapse
         target_ss = spin_2s * (spin_2s + 2) / 4.0
         mc.fix_spin_(ss=target_ss, shift=0.5)
@@ -624,6 +630,8 @@ def parse_args():
                    help="Scan n_qicas - n_below sizes (default: 4)")
     p.add_argument("--n-above",     type=int, default=2,
                    help="Scan n_qicas + n_above sizes (default: 2)")
+    p.add_argument("--max-orbs",    type=int, default=16,
+                   help="Hard cap on n_orb to avoid memory wall (default: 16)")
     p.add_argument("--scratch",     default="/tmp/noon_scan",
                    help="DMRG scratch directory")
     p.add_argument("--qicas-json",  default="qicas_result.json")
@@ -664,7 +672,8 @@ def main():
                         out_json=args.scan_json,
                         n_below=args.n_below,
                         n_above=args.n_above,
-                        scratch=args.scratch)
+                        scratch=args.scratch,
+                        max_orbs=args.max_orbs)
 
     # Phase 3
     print(f"\n{'='*60}")
