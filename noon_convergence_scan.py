@@ -55,6 +55,10 @@ import sys
 import time
 
 import numpy as np
+try:
+    from pyscf import dft as _dft_mod
+except ImportError:
+    _dft_mod = None
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -188,6 +192,7 @@ def build_mol(name, s, gto):
 
 def run_uhf(mol, scf, s):
     """DFT/PBE0 with multiple fallback strategies."""
+    from pyscf import dft
     if s["spin_2s"] == 0:
         mf = dft.RKS(mol)
         mf.xc = 'pbe0'

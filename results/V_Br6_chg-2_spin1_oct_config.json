@@ -1,0 +1,20 @@
+{
+  "metal": "V",
+  "ligand": "Br",
+  "charge": -2,
+  "spin_2s": 1,
+  "geometry": "oct",
+  "dist_ang": 2.318,
+  "autocas_reference": {
+    "ne": 23,
+    "no": 12
+  },
+  "n_ligands": 6,
+  "M": 100,
+  "sweeps": 35,
+  "window_size": 22,
+  "spin_cat": "low",
+  "_time": "06:00:00",
+  "_mem": "32G",
+  "name": "V_Br6_chg-2_spin1_oct"
+}
