@@ -249,7 +249,7 @@ def select_window(mf, s, scf):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_qicas(name, s, out_json="qicas_result.json",
-              M=100, nsweeps=30, scratch="/tmp/noon_scan"):
+              M=100, nsweeps=30, scratch="/tmp/noon_scan", args=None):
     """
     Run UHF + DMRG on the orbital window.
     Returns a dict saved to out_json with:
@@ -364,6 +364,10 @@ def run_qicas(name, s, out_json="qicas_result.json",
     if (n_elec_act - mol.spin) % 2 != 0: n_elec_act -= 2
     n_elec_act  = int(np.clip(n_elec_act, mol.spin, 2 * d_cas))
     print(f"  QICAS:  CAS({n_elec_act}, {d_cas})")
+    # Override from --qicas-n-active if provided (matches paper FQI result)
+    if getattr(args, "qicas_n_active", None):
+        print(f"  [OVERRIDE] n_active {d_cas} → {args.qicas_n_active} (from --qicas-n-active)")
+        d_cas = args.qicas_n_active
 
     # ── Save result ───────────────────────────────────────────────────────────
     result = {
@@ -637,6 +641,8 @@ def parse_args():
                    help="Scan n_qicas + n_above sizes (default: 2)")
     p.add_argument("--max-orbs",    type=int, default=16,
                    help="Hard cap on n_orb to avoid memory wall (default: 16)")
+    p.add_argument("--qicas-n-active", type=int, default=None,
+                   help="Override QICAS n_active from paper (shifts dashed line to match paper)")
     p.add_argument("--scratch",     default="/tmp/noon_scan",
                    help="DMRG scratch directory")
     p.add_argument("--qicas-json",  default="qicas_result.json")
