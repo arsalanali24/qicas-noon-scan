@@ -533,7 +533,7 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_plot(scan_json="scan_results.json", qicas_json="qicas_result.json",
-              out_prefix="noon_convergence"):
+              out_prefix="noon_convergence", qicas_n_active_override=None):
     """
     Reproduce the autoCAS-style NOON convergence figure.
 
@@ -547,6 +547,9 @@ def make_plot(scan_json="scan_results.json", qicas_json="qicas_result.json",
 
     name      = scan["name"]
     n_qicas   = scan.get("n_qicas") or scan.get("n_active_qicas") or scan.get("n_active") or 14
+    if qicas_n_active_override:
+        print(f"  [PLOT] n_qicas override: {n_qicas} → {qicas_n_active_override} (paper value)")
+        n_qicas = qicas_n_active_override
     n_elec    = scan["n_elec_fixed"]
     scan_data = [d for d in scan["scan"] if d["status"] == "OK"]
 
@@ -692,7 +695,8 @@ def main():
     print(f"{'='*60}")
     make_plot(scan_json=args.scan_json,
               qicas_json=args.qicas_json,
-              out_prefix=args.plot_prefix)
+              out_prefix=args.plot_prefix,
+              qicas_n_active_override=args.qicas_n_active)
 
     print(f"\n  Total wall time: {time.time()-t_total:.1f}s")
     print("  Done.")
