@@ -208,3 +208,18 @@ Common verified combinations:
 - [MnBr4]²⁻ charge=-2, 2S=5 (Mn²⁺ d⁵ sextet) 167e ✓
 - [MnBr4]²⁻ charge=-2, 2S=3 (Mn²⁺ d⁵ quartet)167e ✓
 - [VCl6]²⁻  charge=-2, 2S=3                    127e ✓
+
+---
+
+## Known QICAS Active Spaces from Paper (use with --qicas-n-active)
+
+| System | Spin | Paper QICAS | Our entropy plateau | Use override? |
+|---|---|---|---|---|
+| MnCl4_chg-2_spin5_tet | Sextet | (21e,14o) | varies | --qicas-n-active 14 |
+| MnCl4_chg-2_spin3_tet | Quartet | (21e,14o) | 13o | --qicas-n-active 14 |
+| MnBr4_chg-2_spin5_tet | Sextet | (19e,13o) | varies | --qicas-n-active 13 |
+| MnBr4_chg-2_spin3_tet | Quartet | (19e,13o) | varies | --qicas-n-active 13 |
+| VBr6_chg-3_spin2_oct  | Triplet | (18e,10o) | varies | --qicas-n-active 10 |
+| NiBr6_chg-4_spin2_oct | Triplet | (22e,12o) | varies | --qicas-n-active 12 |
+| VBr6_chg-2_spin1_oct  | Doublet | (23e,12o) | varies | --qicas-n-active 12 |
+| MnBr4_chg-1_spin0_tet | Singlet | (24e,14o) | varies | --qicas-n-active 14 |
