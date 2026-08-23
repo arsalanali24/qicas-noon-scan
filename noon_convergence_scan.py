@@ -192,17 +192,15 @@ def build_mol(name, s, gto):
 
 def run_uhf(mol, scf, s):
     """DFT/PBE0 with multiple fallback strategies."""
-    from pyscf import dft
     if s["spin_2s"] == 0:
-        mf = dft.RKS(mol)
-        mf.xc = 'pbe0'
-        print("  [DFT] Using RKS/PBE0 (singlet)")
+        mf = scf.RHF(mol)
+        print("  [HF] Using RHF (singlet)")
     else:
-        mf = dft.UKS(mol)
-        mf.xc = 'pbe0'
-        print("  [DFT] Using UKS/PBE0")
-    mf.max_cycle = 500
-    mf.conv_tol  = 1e-10
+        mf = scf.UHF(mol)
+        print("  [HF] Using UHF")
+    mf.max_cycle = 1000
+    mf.conv_tol  = 1e-9
+    mf.diis_space = 12
     for init, ls, damp in [("atom", 0.2, 0.0),
                              ("minao", 0.5, 0.0),
                              ("minao", 0.3, 0.5),
@@ -483,7 +481,7 @@ def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
         # Run CASSCF
         t0  = time.time()
         mc  = mcscf.CASSCF(mf, n_orb, n_elec_fixed)
-        mc.max_cycle_macro = 1
+        mc.max_cycle_macro = 100
         mc.conv_tol        = 1e-8
         mc.verbose         = 3
         target_ss = spin_2s * (spin_2s + 2) / 4.0
