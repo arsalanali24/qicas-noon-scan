@@ -1,174 +1,137 @@
 #!/usr/bin/env python3
 """
-noon_convergence_scan.py
-========================
-Runs QICAS on V_Cl6_chg-2_spin3_oct_d2p394, then performs a CASSCF
-active-space size scan to produce NOON convergence plots equivalent to
-the autoCAS-style figures.
+noon_convergence_scan.py — NOON Convergence Scan for QICAS Validation
+=====================================================================
+Reconstructed from:
+  - setup_scan.py        (CLI contract, SLURM generation, system dict shape)
+  - qicas_canonical.py   (QICAS core: build_mol, run_hf, run_dmrg, entropies,
+                          plateau detection, QICAS rotation)
+  - CONTEXT.md           (CRITICAL parameters, corrected window rule, RDM rule,
+                          fix_spin_ enforcement, known issues)
+  - 10 screenshots       (plot styling, scan ranges, color scheme, axis labels)
+  - .gitignore           (output file names: qicas_result.json, scan_results.json,
+                          noon_convergence.png/pdf)
 
-Two-phase workflow
-------------------
-Phase 1 — QICAS (DMRG, M=100)
-    UHF → frontier window → DMRG → entropy-ranked orbital ordering
-    Saves:  qicas_result.json   (orbital ordering + DMRG NOONs)
+Pipeline:
+  Phase 1 (QICAS):  UHF → frontier window → low-M DMRG → entropy profile
+                    → plateau detection → recommended CAS(n_elec, n_orb)
+  Phase 2 (SCAN):   CASCI at sizes n_qicas-N_BELOW to n_qicas+N_ABOVE
+                    → extract NOONs from active-space 1-RDM
+  Phase 3 (PLOT):   Two-panel convergence plot
 
-Phase 2 — CASSCF size scan
-    For each n_orb in [n_min … n_qicas + 2]:
-        Take top-n_orb entropy-ranked orbitals
-        Run CASSCF(n_elec_fixed, n_orb)
-        Extract NOONs from 1-RDM eigenvalues
-    Saves:  scan_results.json
+CLI contract (from setup_scan.py generate_slurm, lines 231-240):
+  python noon_convergence_scan.py \\
+      --system_dict '{...}' \\
+      [--skip-qicas] \\
+      --M 100 --n-below 4 --n-above 2 \\
+      --scratch <path> \\
+      --qicas-json <path> --scan-json <path> --plot-prefix <path>
 
-Phase 3 — Plot
-    NOON vs orbital index, one curve per active space size
-    Saves:  noon_convergence.pdf  +  noon_convergence.png
-
-Usage
------
-# Full run (both phases + plot):
-    source ~/.block2_fix/block2_env.sh
-    python noon_convergence_scan.py
-
-# Skip QICAS if already done (re-use saved JSON):
-    python noon_convergence_scan.py --skip-qicas
-
-# Skip scan too, just replot:
-    python noon_convergence_scan.py --only-plot
-
-# Different system (must be in SYSTEMS dict in qicas_canonical.py):
-    python noon_convergence_scan.py --system Mo_Br4_chg0_spin4_tet_d2p451
-
-System chosen for demo
-----------------------
-V_Cl6_chg-2_spin3_oct_d2p394
-  spin_2s = 3  (S = 3/2, high-spin)
-  No ECP required  (pure 3d metal)
-  CI dim at QICAS recommendation ≈ 120–52 k  (plain CASSCF, seconds each)
-  Scan range: ~5 sizes, each < 1 min on a single node
+CRITICAL (from CONTEXT.md — NEVER CHANGE):
+  M = 100 always
+  Window: 26 (2S>=4), 24 (2S=2-3), 22 (2S=0-1) — based on spin, NOT n_ligands
+  CASCI: fix_spin_(ss=spin_2s*(spin_2s+2)/4.0, shift=0.5)
+  NOONs: mc.fcisolver.make_rdm1(mc.ci, mc.ncas, mc.nelecas)  NOT mc.make_rdm1()
 """
 
-import argparse
-import json
-import math
 import os
 import sys
+import json
 import time
-
+import math
+import argparse
+import traceback
 import numpy as np
-try:
-    from pyscf import dft as _dft_mod
-except ImportError:
-    _dft_mod = None
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 
-# ── Path setup: allow running from repo root or scripts/ ──────────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in [_HERE, os.path.join(_HERE, "..")]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-# ── PySCF imports (only needed for phases 1 & 2) ─────────────────────────────
-def _import_pyscf():
-    try:
-        from pyscf import gto, scf, mcscf, dft
-        from pyscf.dmrgscf import dmrgci
-        return gto, scf, mcscf, dmrgci
-    except ImportError as e:
-        print(f"[ERROR] PySCF / block2 not available: {e}")
-        print("        Activate: source ~/.block2_fix/block2_env.sh")
-        sys.exit(1)
+# ── Source: qicas_canonical.py lines 32-35 ────────────────────────────
+from scipy.linalg import expm as scipy_expm
+from scipy.optimize import minimize as scipy_minimize
+from pyscf import gto, scf, mcscf
+from pyscf import dmrgscf
+from pyscf.dmrgscf import dmrgci
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# System definition  (matches qicas_canonical.py exactly)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Constants
+# ═══════════════════════════════════════════════════════════════════════
 
-# Geometry builders
+# Source: qicas_canonical.py line 38
+METALS_ECP = {'Mo', 'Ru', 'Rh', 'Pd', 'Ir', 'Pt', 'Os', 'Re', 'W', 'Au'}
+
+# Source: CONTEXT.md "CRITICAL — DMRG Parameters" table
+#   Window rule: 26 if spin_2s>=4 else (24 if spin_2s>=2 else 22)
+#   "NOT based on n_ligands — this was a bug in early versions"
+# Contrast: qicas_canonical.py line 167 has the BUGGY rule:
+#   win=26 if s['spin_2s']>=5 else (24 if s['n_ligands']>=6 else 20)
+DMRG_PARAMS = {
+    'HIGH':   {'spin_min': 4, 'window': 26, 'M': 100, 'sweeps': 30},
+    'MEDIUM': {'spin_min': 2, 'window': 24, 'M': 100, 'sweeps': 30},
+    'LOW':    {'spin_min': 0, 'window': 22, 'M': 100, 'sweeps': 35},
+}
+
+
+def spin_category(spin_2s):
+    """Source: setup_scan.py get_spin_category (lines 67-69)"""
+    if spin_2s >= 4:
+        return 'HIGH'
+    if spin_2s >= 2:
+        return 'MEDIUM'
+    return 'LOW'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Geometry builders — Source: qicas_canonical.py lines 40-59
+# ═══════════════════════════════════════════════════════════════════════
+
 def _oct(d):
-    return [(d,0,0),(-d,0,0),(0,d,0),(0,-d,0),(0,0,d),(0,0,-d)]
+    return [(d, 0, 0), (-d, 0, 0), (0, d, 0), (0, -d, 0), (0, 0, d), (0, 0, -d)]
 
 def _tet(d):
-    s = d / math.sqrt(3)
-    return [(s,s,s),(s,-s,-s),(-s,s,-s),(-s,-s,s)]
+    c = d / math.sqrt(3)
+    return [(c, c, c), (-c, -c, c), (-c, c, -c), (c, -c, -c)]
 
 def _sqpl(d):
-    return [(d,0,0),(-d,0,0),(0,d,0),(0,-d,0)]
+    return [(d, 0, 0), (-d, 0, 0), (0, d, 0), (0, -d, 0)]
 
-GEOM_BUILDERS = {"oct": _oct, "tet": _tet, "sq_pl": _sqpl}
+GEOM_BUILDERS = {'oct': _oct, 'tet': _tet, 'sq_pl': _sqpl, 'sqpl': _sqpl, 'sq': _sqpl}
 
+# Source: qicas_canonical.py lines 49-59
+# NOTE: setup_scan.py only uses simple ligands (Cl, Br, F, O, N)
+# but we keep the full table from qicas_canonical.py for compatibility
 LIGAND_ATOMS = {
-    "Cl": [("Cl", 1)], "Br": [("Br", 1)], "F": [("F", 1)],
-    "I":  [("I",  1)], "H":  [("H",  1)], "O": [("O", 1)],
-    "N":  [("N",  1)], "S":  [("S",  1)],
-}
-
-# All high-spin systems available for --system override
-SYSTEMS = {
-    "V_Cl6_chg-2_spin3_oct_d2p394":  dict(spin_2s=3, metal="V",  ligand_raw="Cl",
-                                           n_ligands=6, geometry="oct", dist_ang=2.394,
-                                           charge=-2, metal_row="3d", needs_ecp=False,
-                                           ref_no=3, ref_ne=9),
-    "V_H4_chg-2_spin3_tet_d1p73":    dict(spin_2s=3, metal="V",  ligand_raw="H",
-                                           n_ligands=4, geometry="tet", dist_ang=1.73,
-                                           charge=-2, metal_row="3d", needs_ecp=False,
-                                           ref_no=3, ref_ne=9),
-    "Mo_Br4_chg0_spin4_tet_d2p451":  dict(spin_2s=4, metal="Mo", ligand_raw="Br",
-                                           n_ligands=4, geometry="tet", dist_ang=2.451,
-                                           charge=0,  metal_row="4d", needs_ecp=True,
-                                           ref_no=6, ref_ne=10),
-
-    "MnCl4_chg-2_spin5_tet":  dict(spin_2s=5, metal="Mn", ligand_raw="Cl",
-                                    n_ligands=4, geometry="tet", dist_ang=2.35,
-                                    charge=-2, metal_row="3d", needs_ecp=False,
-                                    ref_no=12, ref_ne=19),
-    "MnCl4_chg-2_spin3_tet":  dict(spin_2s=3, metal="Mn", ligand_raw="Cl",
-                                    n_ligands=4, geometry="tet", dist_ang=2.35,
-                                    charge=-2, metal_row="3d", needs_ecp=False,
-                                    ref_no=12, ref_ne=19),
-    "MnBr4_chg-2_spin5_tet":  dict(spin_2s=5, metal="Mn", ligand_raw="Br",
-                                    n_ligands=4, geometry="tet", dist_ang=2.63,
-                                    charge=-2, metal_row="3d", needs_ecp=False,
-                                    ref_no=12, ref_ne=19),
-    "MnBr4_chg-2_spin3_tet":  dict(spin_2s=3, metal="Mn", ligand_raw="Br",
-                                    n_ligands=4, geometry="tet", dist_ang=2.63,
-                                    charge=-2, metal_row="3d", needs_ecp=False,
-                                    ref_no=12, ref_ne=19),
-
-    "VBr6_chg-3_spin2_oct":   dict(spin_2s=2, metal="V",  ligand_raw="Br",
-                                    n_ligands=6, geometry="oct", dist_ang=2.318,
-                                    charge=-3, metal_row="3d", needs_ecp=False,
-                                    ref_no=6,  ref_ne=10),
-    "NiBr6_chg-4_spin2_oct":  dict(spin_2s=2, metal="Ni", ligand_raw="Br",
-                                    n_ligands=6, geometry="oct", dist_ang=2.53,
-                                    charge=-4, metal_row="3d", needs_ecp=False,
-                                    ref_no=5,  ref_ne=10),
-    "VBr6_chg-2_spin1_oct":   dict(spin_2s=1, metal="V",  ligand_raw="Br",
-                                    n_ligands=6, geometry="oct", dist_ang=2.318,
-                                    charge=-2, metal_row="3d", needs_ecp=False,
-                                    ref_no=3,  ref_ne=4),
-    "MnBr4_chg-1_spin0_tet":  dict(spin_2s=0, metal="Mn", ligand_raw="Br",
-                                    n_ligands=4, geometry="tet", dist_ang=2.63,
-                                    charge=-1, metal_row="3d", needs_ecp=False,
-                                    ref_no=13, ref_ne=18),
-    "Ti_Cl6_chg0_spin4_oct_d2p115":  dict(spin_2s=4, metal="Ti", ligand_raw="Cl",
-                                           n_ligands=6, geometry="oct", dist_ang=2.115,
-                                           charge=0,  metal_row="3d", needs_ecp=False,
-                                           ref_no=4, ref_ne=10),
+    'Cl': [('Cl', 1)], 'Br': [('Br', 1)], 'F': [('F', 1)], 'I': [('I', 1)],
+    'H': [('H', 1)], 'O': [('O', 1)], 'N': [('N', 1)], 'S': [('S', 1)],
+    'C': [('C', 1)],
+    'CN': [('C', 1), ('N', 1)],
+    'NH3': [('N', 1), ('H', 3)],
+    'H2O': [('O', 1), ('H', 2)],
+    'PH3': [('P', 1), ('H', 3)],
 }
 
 
-def build_mol(name, s, gto):
-    """Build a PySCF Mole object from the system dict."""
-    dist    = s["dist_ang"] or 2.10
-    builder = GEOM_BUILDERS.get(s["geometry"], _oct)
-    lig_pos = builder(dist)[: s["n_ligands"]]
-    atoms   = [(s["metal"], (0., 0., 0.))]
-    tmpl    = LIGAND_ATOMS.get(s["ligand_raw"], [("Cl", 1)])
+# ═══════════════════════════════════════════════════════════════════════
+#  Molecule and HF — Source: qicas_canonical.py lines 111-158
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_mol(s):
+    """Build PySCF molecule from system dictionary.
+
+    Source: qicas_canonical.py build_mol (lines 111-131)
+    Adaptation: setup_scan.py uses key 'ligand' not 'ligand_raw'
+    """
+    dist = s.get('dist_ang') or 2.10
+    geometry = s.get('geometry', 'oct')
+    builder = GEOM_BUILDERS.get(geometry, _oct)
+    n_ligands = s.get('n_ligands', 6)
+    lig_pos = builder(dist)[:n_ligands]
+
+    atoms = [(s['metal'], (0., 0., 0.))]
+    # setup_scan.py uses 'ligand'; qicas_canonical.py uses 'ligand_raw'
+    ligand_key = s.get('ligand_raw', s.get('ligand', 'Cl'))
+    tmpl = LIGAND_ATOMS.get(ligand_key, [('Cl', 1)])
+
     for pos in lig_pos:
-        r  = math.sqrt(sum(x**2 for x in pos))
+        r = math.sqrt(sum(x**2 for x in pos))
         uv = tuple(x / r for x in pos) if r > 0 else (1, 0, 0)
         off = 0.0
         for sym, nrep in tmpl:
@@ -176,529 +139,792 @@ def build_mol(name, s, gto):
                 coord = tuple(pos[i] + uv[i] * off for i in range(3))
                 atoms.append((sym, coord))
                 off += 1.10
+
     mol = gto.Mole()
-    mol.atom     = atoms
-    mol.charge   = s["charge"]
-    mol.spin     = s["spin_2s"]
-    mol.basis    = "def2-svp"
-    mol.unit     = "angstrom"
+    mol.atom = atoms
+    mol.charge = s['charge']
+    mol.spin = s['spin_2s']
+    mol.basis = 'def2-svp'
+    mol.unit = 'angstrom'
     mol.symmetry = False
-    if s["needs_ecp"]:
-        mol.ecp = {s["metal"]: "def2-svp"}
+    if s.get('needs_ecp', s['metal'] in METALS_ECP):
+        mol.ecp = {s['metal']: 'def2-svp'}
     mol.verbose = 4
     mol.build()
     return mol
 
 
-def run_uhf(mol, scf, s):
-    """DFT/PBE0 with multiple fallback strategies."""
-    if s["spin_2s"] == 0:
+def run_hf(mol):
+    """Run HF — RHF for singlets, UHF otherwise.
+
+    Source: qicas_canonical.py run_hf (lines 134-158)
+    Note: "UHF rebuilds in Phase 2" (CONTEXT.md Known Issues) is expected.
+    """
+    if mol.spin == 0:
         mf = scf.RHF(mol)
-        print("  [HF] Using RHF (singlet)")
+        print("  [HF] Using RHF (singlet — prevents broken-symmetry UHF)")
     else:
         mf = scf.UHF(mol)
-        print("  [HF] Using UHF")
-    mf.max_cycle = 1000
-    mf.conv_tol  = 1e-9
-    mf.diis_space = 12
-    for init, ls, damp in [("atom", 0.2, 0.0),
-                             ("minao", 0.5, 0.0),
-                             ("minao", 0.3, 0.5),
-                             ("1e",   0.5, 0.3)]:
-        mf.init_guess  = init
-        mf.level_shift = ls
-        mf.damp        = damp
+        print(f"  [HF] Using UHF (spin_2s={mol.spin})")
+
+    mf.max_cycle = 500
+    mf.conv_tol = 1e-10
+    mf.init_guess = 'atom'
+    mf.level_shift = 0.2
+
+    try:
         mf.kernel()
-        if mf.converged:
-            print(f"  [UHF] Converged (init={init}, ls={ls})")
-            return mf
-    raise RuntimeError("UHF did not converge with any strategy")
+    except Exception:
+        mf.init_guess = 'minao'
+        mf.kernel()
+    if not mf.converged:
+        mf.level_shift = 0.5
+        mf.kernel()
+    if not mf.converged:
+        mf.init_guess = 'minao'
+        mf.level_shift = 0.3
+        mf.damp = 0.5
+        mf.kernel()
+    if not mf.converged:
+        mf.init_guess = '1e'
+        mf.level_shift = 0.5
+        mf.damp = 0.3
+        mf.kernel()
+    if not mf.converged:
+        raise RuntimeError("HF did not converge after all attempts")
+    return mf
 
 
-def select_window(mf, s, scf):
-    """Frontier orbital window — mirrors qicas_canonical.py exactly."""
-    # Handle both RHF (singlet) and UHF
-    if s["spin_2s"] == 0:
-        # RKS: mo_coeff is (nao, nmo), mo_occ is (nmo,)
-        n_mo = mf.mo_coeff.shape[1]
-        n_a  = int((mf.mo_occ > 0).sum())
-        n_b  = int((mf.mo_occ > 1).sum())
-    else:
-        # UKS: mo_coeff is (2, nao, nmo)
+# ═══════════════════════════════════════════════════════════════════════
+#  Window selection — CORRECTED rule from CONTEXT.md
+# ═══════════════════════════════════════════════════════════════════════
+
+def select_window(mf, spin_2s):
+    """Select frontier orbital window for DMRG.
+
+    CORRECTED rule (source: CONTEXT.md "CRITICAL — DMRG Parameters"):
+      window = 26 if spin_2s >= 4 else (24 if spin_2s >= 2 else 22)
+
+    BUGGY rule in qicas_canonical.py line 167 was:
+      win = 26 if s['spin_2s'] >= 5 else (24 if s['n_ligands'] >= 6 else 20)
+    Differences: threshold 4 vs 5, spin-based vs n_ligands-based, 22 vs 20.
+
+    Centering and singly-occupied inclusion logic from qicas_canonical.py L163-174.
+    """
+    cat = spin_category(spin_2s)
+    win = DMRG_PARAMS[cat]['window']
+
+    if isinstance(mf, scf.uhf.UHF):
         n_mo = mf.mo_coeff[0].shape[1]
-        n_a  = int(mf.mo_occ[0].sum())
-        n_b  = int(mf.mo_occ[1].sum())
-    win  = 26 if s["spin_2s"] >= 4 else (24 if s["spin_2s"] >= 2 else 22)
+        n_a = int(mf.mo_occ[0].sum())
+        n_b = int(mf.mo_occ[1].sum())
+    else:
+        n_mo = mf.mo_coeff.shape[1]
+        n_a = int((mf.mo_occ > 0).sum())
+        n_b = n_a
+
+    # Center window on HOMO (same logic as qicas_canonical.py L168-170)
     half = win // 2
     start = max(0, n_a - half)
-    end   = min(n_mo, start + win)
+    end = min(n_mo, start + win)
     if end - start < win:
         start = max(0, end - win)
     window = list(range(start, end))
+
+    # Ensure all singly-occupied orbitals are included (L171-173)
     for idx in range(n_b, n_a):
         if idx not in window:
-            window = list(range(min(window[0], idx),
-                                max(window[-1] + 1, idx + 1)))
+            window = list(range(min(window[0], idx), max(window[-1] + 1, idx + 1)))
+
     return window
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1 — QICAS (DMRG)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  DMRG and entropy — Source: qicas_canonical.py lines 177-264
+# ═══════════════════════════════════════════════════════════════════════
 
-def run_qicas(name, s, out_json="qicas_result.json",
-              M=100, nsweeps=30, scratch="/tmp/noon_scan", args=None):
-    """
-    Run UHF + DMRG on the orbital window.
-    Returns a dict saved to out_json with:
-        window_indices   — absolute MO indices in the window
-        entropy_ranked   — window-relative indices sorted by entropy (desc)
-        noon_window      — DMRG 1-RDM diagonal (NOONs for all window orbs)
-        n_active_qicas   — QICAS-recommended number of active orbitals
-        n_elec_qicas     — corresponding electron count
-        e_dmrg           — DMRG total energy
-    """
-    gto, scf, mcscf, dmrgci = _import_pyscf()
+def run_dmrg(mol, mf, window, M=100, nsweeps=30, scratch='/tmp/dmrg'):
+    """Source: qicas_canonical.py run_dmrg (lines 177-202)"""
     os.makedirs(scratch, exist_ok=True)
 
+    if isinstance(mf, scf.uhf.UHF):
+        occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
+        mo_alpha = mf.mo_coeff[0]
+    else:
+        occ = mf.mo_occ / 2.0
+        mo_alpha = mf.mo_coeff
+
+    # Electron count in window (with spin-parity enforcement)
+    n_e = int(round(2 * occ[window].sum()))
+    if (n_e - mol.spin) % 2 != 0:
+        n_e += 1
+    if (n_e - mol.spin) % 2 != 0:
+        n_e -= 2
+    n_e = int(np.clip(n_e, mol.spin, 2 * len(window)))
+
+    # Reorder MOs: core | window | other | virtual
+    n_mo = mo_alpha.shape[1]
+    all_i = list(range(n_mo))
+    core = sorted([i for i in all_i if i not in window and occ[i] > 1.5])
+    virt = sorted([i for i in all_i if i not in window and occ[i] < 0.5])
+    other = sorted([i for i in all_i if i not in window
+                     and i not in core and i not in virt])
+    mo_ord = mo_alpha[:, core + window + other + virt]
+
+    mc = mcscf.CASSCF(mf.to_rhf(), len(window), n_e)
+    mc.fcisolver = dmrgci.DMRGCI(mol, maxM=M, tol=1e-8)
+    mc.fcisolver.scratchDirectory = scratch
+    mc.fcisolver.runtimeDir = scratch
+    mc.fcisolver.maxIter = nsweeps
+    mc.fcisolver.block_extra_keyword = ['num_thrds 8']
+    # CONTEXT.md: "max_cycle_macro=1 is intentional"
+    # "converged=False is Expected"
+    mc.max_cycle_macro = 1
+    e = mc.kernel(mo_ord)[0]
+
+    return mc, float(e), mo_ord, n_e
+
+
+def get_rdms(mc):
+    """Extract 1- and 2-RDMs from the DMRG solver.
+
+    CRITICAL (source: CONTEXT.md "CRITICAL — RDM Extraction"):
+      Use mc.fcisolver.make_rdm12(mc.ci, mc.ncas, mc.nelecas)
+      NOT mc.make_rdm12() which returns full AO-basis RDM.
+
+    Source: qicas_canonical.py get_rdms (lines 210-219)
+    """
+    try:
+        dm1, dm2 = mc.fcisolver.make_rdm12(mc.ci, mc.ncas, mc.nelecas)
+        print(f"  [RDM] make_rdm12 OK  Tr(1-RDM) = {np.trace(dm1):.4f}")
+        return dm1, dm2
+    except Exception as e:
+        print(f"  [RDM] MF approximation for 2-RDM ({e})")
+        dm1 = mc.fcisolver.make_rdm1(mc.ci, mc.ncas, mc.nelecas)
+        n = mc.ncas
+        dm2 = np.zeros((n, n, n, n))
+        for i in range(n):
+            dm2[i, i, i, i] = (dm1[i, i] / 2)**2 * 4
+        return dm1, dm2
+
+
+def _single_orbital_entropy(n_i, G_ii):
+    """Source: qicas_canonical.py _S (lines 205-207)"""
+    lam = np.clip([1 - 2*n_i + G_ii, n_i - G_ii, n_i - G_ii, G_ii], 1e-14, 1.0)
+    lam /= lam.sum()
+    return -float(np.dot(lam, np.log(lam)))
+
+
+def entropies_from_rdms(gamma, Gamma, n):
+    """Source: qicas_canonical.py entropies_from_rdms (lines 222-223)"""
+    return np.array([_single_orbital_entropy(gamma[i, i] / 2, Gamma[i, i, i, i] / 4)
+                     for i in range(n)])
+
+
+def entropy_plateau_cas_size(ent, spin_2s, floor=0.02, min_act=2):
+    """Find CAS size from largest gap in the entropy profile.
+
+    Source: qicas_canonical.py entropy_plateau_cas_size (lines 226-240)
+    """
+    ss = np.sort(ent)[::-1]
+    n_sig = int(np.sum(ss > floor))
+    if n_sig <= max(spin_2s, min_act):
+        return max(spin_2s, min_act)
+    gaps = ss[:-1] - ss[1:]
+    gaps_restricted = gaps[:n_sig]
+    d = int(np.argmax(gaps_restricted)) + 1
+    return int(np.clip(max(d, spin_2s, min_act), 2, n_sig))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase 1: Run QICAS — build mol → HF → DMRG → entropies → plateau
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_qicas_phase(system, M=100, sweeps=30, scratch='/tmp/dmrg'):
+    """Phase 1: Determine the recommended active space via QICAS entropy
+    plateau detection.
+
+    Returns a dict with:
+      - n_active_qicas, n_elec_qicas  (consumed by setup_scan.py L306/325)
+      - entropy_profile               (needed for bottom panel plot)
+      - _internal: mol, mf, mo_ord, window, ent_rank  (for same-session Phase 2)
+    """
+    name = system.get('name', 'unknown')
+    spin_2s = system['spin_2s']
+    cat = spin_category(spin_2s)
+    params = DMRG_PARAMS[cat]
+
     print(f"\n{'='*60}")
-    print(f"  Phase 1 — QICAS on {name}")
+    print(f"  Phase 1: QICAS — {name}")
+    print(f"  Spin: 2S={spin_2s}  Category: {cat}")
+    print(f"  DMRG: M={M}, sweeps={sweeps}, window={params['window']}")
     print(f"{'='*60}")
 
-    # ── Step 1: Build molecule ────────────────────────────────────────────────
-    print("\n[Step 1] Building molecule ...")
-    mol = build_mol(name, s, gto)
-    print(f"  Atoms: {mol.natm},  charge: {mol.charge},  spin_2s: {mol.spin}")
-
-    # ── Step 2: UHF ──────────────────────────────────────────────────────────
-    print("\n[Step 2] UHF ...")
     t0 = time.time()
-    mf = run_uhf(mol, scf, s)
-    print(f"  E(UHF) = {mf.e_tot:.8f}  ({time.time()-t0:.1f}s)")
 
-    # ── Step 3: Orbital window ────────────────────────────────────────────────
-    window = select_window(mf, s, scf)
-    n_win  = len(window)
-    print(f"\n[Step 3] Window: {n_win} orbitals  (indices {window[0]}–{window[-1]})")
+    # Step 1: Build molecule
+    print("\n[Step 1] Building molecule...")
+    mol = build_mol(system)
+    n_electrons = int(mol.nelectron)
+    n_basis = int(mol.nao_nr())
+    print(f"  {n_electrons} electrons, {n_basis} basis functions")
 
-    # ── Step 4: DMRG on window ───────────────────────────────────────────────
-    print(f"\n[Step 4] DMRG  M={M}, sweeps={nsweeps} ...")
-    # Handle RHF (singlet) vs UHF
-    if mol.spin == 0:
-        occ = mf.mo_occ / 2.0   # RHF: mo_occ counts electrons per orbital (0 or 2)
-    else:
-        occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0  # UHF: alpha + beta
-    n_e   = int(round(2 * occ[window].sum()))
-    if (n_e - mol.spin) % 2 != 0: n_e += 1
-    if (n_e - mol.spin) % 2 != 0: n_e -= 2
-    n_e   = int(np.clip(n_e, mol.spin, 2 * n_win))
+    # Step 2: Hartree-Fock
+    print("\n[Step 2] Hartree-Fock...")
+    t1 = time.time()
+    mf = run_hf(mol)
+    e_hf = float(mf.e_tot)
+    print(f"  E(HF) = {e_hf:.8f}  ({time.time()-t1:.1f}s)")
 
-    # Handle RHF vs UHF mo_coeff
-    if mol.spin == 0:
-        mo_alpha = mf.mo_coeff          # RHF: (nao, nmo)
-    else:
-        mo_alpha = mf.mo_coeff[0]       # UHF: alpha spin (nao, nmo)
-    n_mo    = mo_alpha.shape[1]
-    all_i   = list(range(n_mo))
-    core    = sorted([i for i in all_i if i not in window and occ[i] > 1.5])
-    virt    = sorted([i for i in all_i if i not in window and occ[i] < 0.5])
-    other   = sorted([i for i in all_i if i not in window
-                       and i not in core and i not in virt])
-    mo_ord  = mo_alpha[:, core + window + other + virt]
+    # Step 3: Select frontier window (CORRECTED rule)
+    print("\n[Step 3] Selecting frontier window...")
+    window = select_window(mf, spin_2s)
+    print(f"  Window: {len(window)} orbitals, indices [{window[0]}..{window[-1]}]")
 
-    mc_dmrg = mcscf.CASSCF(mf, n_win, n_e)
-    mc_dmrg.fcisolver = dmrgci.DMRGCI(mol, maxM=M, tol=1e-8)
-    mc_dmrg.fcisolver.scratchDirectory  = scratch
-    mc_dmrg.fcisolver.runtimeDir        = scratch
-    mc_dmrg.fcisolver.maxIter           = nsweeps
-    mc_dmrg.fcisolver.block_extra_keyword = ["num_thrds 8"]
-    mc_dmrg.max_cycle_macro = 1          # single-shot DMRG, no orbital opt
-
-    t0 = time.time()
-    e_dmrg = mc_dmrg.kernel(mo_ord)[0]
-    t_dmrg = time.time() - t0
+    # Step 4: DMRG
+    print(f"\n[Step 4] DMRG (M={M}, {sweeps} sweeps)...")
+    t1 = time.time()
+    mc_dmrg, e_dmrg, mo_ord, n_elec_win = run_dmrg(
+        mol, mf, window, M=M, nsweeps=sweeps, scratch=scratch)
+    t_dmrg = time.time() - t1
     print(f"  E(DMRG) = {e_dmrg:.8f}  ({t_dmrg:.1f}s)")
+    print(f"  Electrons in window: {n_elec_win}")
 
-    # ── Step 5: Extract 1-RDM → NOONs and entropies ─────────────────────────
-    print("\n[Step 5] Extracting RDMs ...")
-    dm1, dm2 = mc_dmrg.fcisolver.make_rdm12(
-        mc_dmrg.ci, mc_dmrg.ncas, mc_dmrg.nelecas)
-    # dm1[i,i] = total occupation of window orbital i  (0 ≤ n_i ≤ 2)
-    noon_window = [float(dm1[i, i]) for i in range(n_win)]
+    # Step 5: Extract RDMs and compute single-orbital entropies
+    print("\n[Step 5] RDMs and single-orbital entropies...")
+    gamma, Gamma = get_rdms(mc_dmrg)
+    n_win = len(window)
+    ent = entropies_from_rdms(gamma, Gamma, n_win)
+    ent_rank = np.argsort(ent)[::-1]           # indices sorted by entropy desc
+    ent_sorted = ent[ent_rank]                  # entropy values sorted desc
+    print(f"  Entropy range: [{ent.min():.4f}, {ent.max():.4f}]")
 
-    # Two-orbital entropy from the diagonal 2-RDM elements
-    def _S2(ni, Gii):
-        lam = np.clip([1 - 2*ni + Gii, ni - Gii, ni - Gii, Gii], 1e-14, 1.0)
-        lam /= lam.sum()
-        return -float(np.dot(lam, np.log(lam)))
+    # Step 6: Find CAS size from entropy plateau
+    d_cas = entropy_plateau_cas_size(ent, spin_2s)
+    print(f"\n[Step 6] Entropy plateau → D_CAS = {d_cas}")
+    print(f"  QICAS recommendation: CAS({n_elec_win}, {d_cas})")
 
-    dm2_phys = dm2.transpose((0, 2, 3, 1)).copy()
-    Gamma     = (2 * dm2_phys + dm2_phys.transpose(0, 1, 3, 2)) / 6.0
-    entropies = np.array([_S2(dm1[i,i]/2, Gamma[i,i,i,i]/4) for i in range(n_win)])
+    t_total = time.time() - t0
 
-    # ── Step 6: QICAS active space from entropy plateau ───────────────────────
-    print("\n[Step 6] Entropy plateau → active space size ...")
-    # Sort by entropy descending; find largest gap below floor
-    entropy_ranked = np.argsort(entropies)[::-1].tolist()
-    ss             = entropies[entropy_ranked]
-    floor          = 0.02
-    sig_mask       = ss > floor
-    n_sig          = int(sig_mask.sum())
-
-    # Largest gap in the significant orbitals → D_CAS
-    if n_sig >= 2:
-        gaps    = ss[:-1] - ss[1:]
-        d_cas   = int(np.argmax(gaps[:n_sig]) + 1)
-    else:
-        d_cas   = max(2, n_sig)
-    d_cas = max(d_cas, s.get("ref_no", 2))     # at least reference size
-    print(f"  Entropy-ranked top entropies: {ss[:d_cas+2].round(4).tolist()}")
-    print(f"  D_CAS (QICAS recommendation) = {d_cas}")
-
-    # Electron count for QICAS active space
-    active_abs  = [window[r] for r in entropy_ranked[:d_cas]]
-    n_elec_act  = int(round(2 * occ[active_abs].sum()))
-    if (n_elec_act - mol.spin) % 2 != 0: n_elec_act += 1
-    if (n_elec_act - mol.spin) % 2 != 0: n_elec_act -= 2
-    n_elec_act  = int(np.clip(n_elec_act, mol.spin, 2 * d_cas))
-    print(f"  QICAS:  CAS({n_elec_act}, {d_cas})")
-    # Override from --qicas-n-active if provided (matches paper FQI result)
-    if getattr(args, "qicas_n_active", None):
-        print(f"  [OVERRIDE] n_active {d_cas} → {args.qicas_n_active} (from --qicas-n-active)")
-        d_cas = args.qicas_n_active
-
-    # ── Save result ───────────────────────────────────────────────────────────
     result = {
-        "name":              name,
-        "spin_2s":           s["spin_2s"],
-        "window_indices":    window,        # absolute MO indices
-        "entropy_ranked":    entropy_ranked, # window-relative, desc entropy
-        "entropies":         entropies.tolist(),
-        "noon_window":       noon_window,    # DMRG NOONs for all window orbs
-        "n_active_qicas":    d_cas,
-        "n_elec_qicas":      n_elec_act,
-        "e_dmrg":            float(e_dmrg),
-        "t_dmrg_s":          float(t_dmrg),
-        # Store MO info needed for Phase 2
-        "n_mo":              n_mo,
-        "core_indices":      core,
-        "window_mo_order":   (core + window + other + virt),
+        # Required by setup_scan.py list_completed (L306) and resume_from_json (L325)
+        'name': name,
+        'n_elec_qicas': int(n_elec_win),
+        'n_active_qicas': int(d_cas),
+        'spin_2s': spin_2s,
+        # Metadata for cross-session resume
+        'metal': system.get('metal'),
+        'ligand': system.get('ligand_raw', system.get('ligand')),
+        'charge': system.get('charge'),
+        'geometry': system.get('geometry'),
+        'n_ligands': system.get('n_ligands'),
+        'dist_ang': system.get('dist_ang'),
+        'needs_ecp': system.get('needs_ecp', system.get('metal', '') in METALS_ECP),
+        # Computational details
+        'n_electrons': n_electrons,
+        'n_basis': n_basis,
+        'e_hf': e_hf,
+        'e_dmrg': e_dmrg,
+        'spin_category': cat,
+        'window_size': n_win,
+        'window_indices': window,
+        'n_elec_window': int(n_elec_win),
+        # Entropy profile (needed for bottom panel plot)
+        'entropy_profile': {
+            'entropies_sorted_desc': ent_sorted.tolist(),
+            'entropies_raw': ent.tolist(),
+            'entropy_rank': ent_rank.tolist(),
+        },
+        't_dmrg_s': t_dmrg,
+        't_total_s': t_total,
+        'status': 'OK',
     }
-    with open(out_json, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"\n  Saved → {out_json}")
+
+    # Internal objects for same-session Phase 2 (NOT serialized)
+    result['_internal'] = {
+        'mol': mol, 'mf': mf, 'mo_ord': mo_ord,
+        'window': window, 'ent_rank': ent_rank,
+    }
+
+    print(f"\n  Phase 1 complete in {t_total:.0f}s")
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2 — CASSCF size scan
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase 2: NOON Scan — CASCI at multiple CAS sizes
+# ═══════════════════════════════════════════════════════════════════════
 
-def run_casscf_scan(name, s, qicas_result, out_json="scan_results.json",
-                    n_below=4, n_above=2, scratch="/tmp/noon_scan", max_orbs=16):
+def build_scan_mo(mo_ord, window, active_indices, n_mo, mf):
+    """Reorder MO matrix placing selected active orbitals in CAS position.
+
+    Source: qicas_canonical.py build_cas_mo (lines 267-281)
+    active_indices: window-relative indices, sorted by entropy descending
     """
-    Run CASSCF at nested active space sizes centred on QICAS recommendation.
+    if isinstance(mf, scf.uhf.UHF):
+        occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
+    else:
+        occ = mf.mo_occ / 2.0
 
-    Scan:  n_orb = n_qicas - n_below  …  n_qicas + n_above
-    Electrons fixed at n_elec_qicas throughout
-      (adding orbitals = adding virtuals → electron count unchanged)
+    all_i = list(range(n_mo))
+    abs_act = [window[r] for r in active_indices]
+    nonact_win = [window[r] for r in range(len(window)) if r not in active_indices]
 
-    For each size:
-        Take top-n_orb orbitals by QICAS entropy ranking
-        Build MO ordering:  core | active (top-n_orb) | rest of window | virtual
-        Run CASSCF(n_elec_qicas, n_orb)
-        Diagonalise 1-RDM → NOONs (eigenvalues, sorted descending)
+    core_nw = sorted([i for i in all_i if i not in window and occ[i] > 1.5])
+    virt_nw = sorted([i for i in all_i if i not in window and occ[i] < 0.5])
+    core_win = sorted([i for i in nonact_win if occ[i] > 1.5])
+    virt_win = sorted([i for i in nonact_win if occ[i] < 0.5])
+    other = [i for i in all_i
+             if i not in sorted(core_nw + virt_nw + core_win + virt_win + abs_act)]
+
+    ordered = sorted(core_nw + core_win) + abs_act + other + sorted(virt_nw + virt_win)
+    return mo_ord[:, np.argsort(ordered)]
+
+
+def run_casci_noon(mf, mo_coeffs, n_cas, n_elec, spin_2s):
+    """Run CASCI for one CAS(n_elec, n_cas) and extract NOONs.
+
+    CRITICAL — Spin enforcement (source: CONTEXT.md):
+      mc.fix_spin_(ss=spin_2s*(spin_2s+2)/4.0, shift=0.5)
+      "Without this, CASCI collapses to wrong spin state at larger active
+       space sizes. Symptom: S² jumps (e.g. 8.75 → 10.86 for sextet)."
+
+    CRITICAL — RDM extraction (source: CONTEXT.md):
+      NOONs from mc.fcisolver.make_rdm1(mc.ci, mc.ncas, mc.nelecas)
+      NOT mc.make_rdm1() — that returns full AO-basis RDM (Tr ≈ N_total).
+
+    Expected log line (source: CONTEXT.md "Checking Results"):
+      Tr(1-RDM) = 21.0000   ← must equal n_active_e
+
+    Returns result dict or None on failure.
     """
-    gto, scf, mcscf, _ = _import_pyscf()
-    os.makedirs(scratch, exist_ok=True)
+    try:
+        mc = mcscf.CASCI(mf.to_rhf(), n_cas, n_elec)
+        mc.verbose = 4
 
-    n_qicas       = qicas_result["n_active_qicas"]
-    n_elec_fixed  = qicas_result["n_elec_qicas"]
-    spin_2s       = qicas_result["spin_2s"]
-    entropy_ranked = qicas_result["entropy_ranked"]   # window-relative
-    window         = qicas_result["window_indices"]   # absolute
-    mo_order_abs   = qicas_result["window_mo_order"]  # full absolute ordering
+        # CRITICAL: enforce spin state
+        ss_target = spin_2s * (spin_2s + 2) / 4.0
+        mc.fix_spin_(ss=ss_target, shift=0.5)
 
-    # Scan range
-    n_min = max(int(math.ceil(n_elec_fixed / 2)), n_qicas - n_below, 2)
-    n_max = n_qicas + n_above
-    scan_sizes = [n for n in range(n_min, n_max + 1) if n <= max_orbs]
+        # CONTEXT.md: "max_cycle_macro=1 is intentional"
+        # "converged=False — Expected"
+        mc.max_cycle_macro = 1
+        e = mc.kernel(mo_coeffs)[0]
+
+        # CRITICAL: active-space RDM, NOT full AO RDM
+        rdm1 = mc.fcisolver.make_rdm1(mc.ci, mc.ncas, mc.nelecas)
+        tr_rdm1 = float(np.trace(rdm1))
+
+        # Verify trace (CONTEXT.md: "Tr(1-RDM) = 21.0000 ← must equal n_active_e")
+        if abs(tr_rdm1 - n_elec) > 0.5:
+            print(f"    ⚠ Tr(1-RDM) = {tr_rdm1:.4f}, expected {n_elec}")
+
+        # NOONs = eigenvalues of 1-RDM, sorted descending
+        noons = np.sort(np.linalg.eigvalsh(rdm1))[::-1]
+
+        # S² (CONTEXT.md: "S^2 = X.75 ← must be consistent throughout")
+        try:
+            s2 = float(mc.spin_square()[0])
+        except Exception:
+            s2 = None
+
+        return {
+            'n_cas': n_cas,
+            'n_elec': n_elec,
+            'energy': float(e),
+            'noons': noons.tolist(),
+            'tr_rdm1': tr_rdm1,
+            's2': s2,
+        }
+
+    except Exception as exc:
+        print(f"    ✗ CAS({n_elec},{n_cas}) FAILED: {exc}")
+        traceback.print_exc()
+        return None
+
+
+def run_noon_scan(qicas_result, n_below=4, n_above=2):
+    """Phase 2: CASCI at multiple CAS sizes around the QICAS recommendation.
+
+    Scan range (verified against all 5 screenshot systems):
+      lower = max(n_qicas - n_below,  (n_elec + spin_2s + 1) // 2)
+      upper = min(n_qicas + n_above,  window_size)
+
+    The lower bound ensures enough orbitals to hold all alpha electrons:
+      n_alpha = (n_elec + spin_2s) / 2
+
+    Evidence from screenshots:
+      VCl6     2S=3 QICAS=14  → sizes 12-16  (min=12=(21+3)/2)
+      MnCl4_s3 2S=3 QICAS=13  → sizes 12-15  (min=12)
+      MnCl4_s5 2S=5 QICAS=14  → sizes 13-16  (min=13=(21+5)/2)
+      MnBr4_s3 2S=3 QICAS=16  → sizes 12-16  (17,18 failed — skipped)
+      MnBr4_s5 2S=5 QICAS=16  → sizes 13-17  (18 failed — skipped)
+
+    Source: CONTEXT.md "UHF rebuilds in Phase 2 — Expected"
+    """
+    name = qicas_result['name']
+    spin_2s = qicas_result['spin_2s']
+    n_elec = qicas_result['n_elec_qicas']
+    n_qicas = qicas_result['n_active_qicas']
+    internal = qicas_result.get('_internal')
+
     print(f"\n{'='*60}")
-    print(f"  Phase 2 — CASSCF scan on {name}")
-    print(f"  QICAS recommendation: CAS({n_elec_fixed}, {n_qicas})")
-    print(f"  Scan: n_orb = {scan_sizes}  (n_elec fixed = {n_elec_fixed})")
+    print(f"  Phase 2: NOON Scan — {name}")
+    print(f"  QICAS: CAS({n_elec}, {n_qicas})")
+    print(f"  Range: n_qicas-{n_below} to n_qicas+{n_above}")
     print(f"{'='*60}")
 
-    # Rebuild molecule and UHF (needed for CASSCF)
-    print("\n[Rebuild mol + UHF for CASSCF] ...")
-    mol = build_mol(name, s, gto)
-    mf  = run_uhf(mol, scf, s)
-    occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
-
-    # Reconstruct the MO coefficient matrix in QICAS ordering
-    # Handle RHF vs UHF
-    if mol.spin == 0:
-        mo_alpha = mf.mo_coeff
+    # ── Get mol / mf / mo_ord ────────────────────────────────────────
+    if internal:
+        mol = internal['mol']
+        mf = internal['mf']
+        mo_ord = internal['mo_ord']
+        window = internal['window']
+        ent_rank = internal['ent_rank']
+        print("  Using Phase 1 objects (same session)")
     else:
-        mo_alpha = mf.mo_coeff[0]
-    n_mo_scan  = mo_alpha.shape[1]
-    mo_ordered = mo_alpha[:, mo_order_abs]   # shape (nao, n_mo)
+        # Cross-session resume: rebuild molecule and HF independently
+        # CONTEXT.md: "UHF rebuilds in Phase 2 — Expected"
+        print("  Rebuilding molecule and HF (cross-session resume)")
+        system = {
+            'name': name,
+            'metal': qicas_result.get('metal'),
+            'ligand': qicas_result.get('ligand'),
+            'charge': qicas_result.get('charge'),
+            'spin_2s': spin_2s,
+            'geometry': qicas_result.get('geometry'),
+            'n_ligands': qicas_result.get('n_ligands'),
+            'dist_ang': qicas_result.get('dist_ang'),
+            'needs_ecp': qicas_result.get('needs_ecp', False),
+        }
+        mol = build_mol(system)
+        mf = run_hf(mol)
+        window = select_window(mf, spin_2s)
+        ent_rank = np.array(qicas_result['entropy_profile']['entropy_rank'])
 
-    # Relative indices of window within mo_ordered
-    # In mo_order_abs: core | window | other | virt
-    n_core     = len(qicas_result["core_indices"])
-    # window starts at index n_core in mo_ordered
-    win_start  = n_core                        # relative index of window[0]
+        # Rebuild mo_ord from HF (same reorder as run_dmrg)
+        if isinstance(mf, scf.uhf.UHF):
+            mo_alpha = mf.mo_coeff[0]
+            occ = (mf.mo_occ[0] + mf.mo_occ[1]) / 2.0
+        else:
+            mo_alpha = mf.mo_coeff
+            occ = mf.mo_occ / 2.0
+        n_mo = mo_alpha.shape[1]
+        all_i = list(range(n_mo))
+        core = sorted([i for i in all_i if i not in window and occ[i] > 1.5])
+        virt = sorted([i for i in all_i if i not in window and occ[i] < 0.5])
+        other = sorted([i for i in all_i if i not in window
+                         and i not in core and i not in virt])
+        mo_ord = mo_alpha[:, core + window + other + virt]
 
-    scan_data = []
+    n_mo = mo_ord.shape[1]
+    window_size = len(window)
+
+    # ── Compute scan range ───────────────────────────────────────────
+    # Minimum: must fit all alpha electrons
+    n_alpha = (n_elec + spin_2s + 1) // 2
+    min_n_orb = max(n_alpha, 2)
+    max_n_orb = window_size
+
+    scan_start = max(n_qicas - n_below, min_n_orb)
+    scan_end = min(n_qicas + n_above, max_n_orb)
+    scan_sizes = list(range(scan_start, scan_end + 1))
+
+    print(f"  n_alpha = {n_alpha}  →  valid range [{min_n_orb}, {max_n_orb}]")
+    print(f"  Scanning sizes: {scan_sizes}")
+
+    # ── Run CASCI at each size ───────────────────────────────────────
+    scan_results = {
+        'name': name,
+        'spin_2s': spin_2s,
+        'n_elec': n_elec,
+        'n_qicas': n_qicas,
+        'scan_sizes_attempted': scan_sizes,
+        'results': {},
+    }
 
     for n_orb in scan_sizes:
-        print(f"\n--- CAS({n_elec_fixed}, {n_orb}) ---")
+        print(f"\n  ── CAS({n_elec}, {n_orb}) "
+              f"{'← QICAS' if n_orb == n_qicas else ''} ──")
 
-        # Top-n_orb window orbitals by entropy (window-relative indices)
-        active_win_rel = entropy_ranked[:n_orb]    # e.g. [13,12,0,1,...]
-        # Convert to position in mo_ordered
-        active_mo_rel  = [win_start + r for r in active_win_rel]
-        # Remaining window orbitals (not in active)
-        rest_win_rel   = [r for r in range(len(window)) if r not in set(active_win_rel)]
-        rest_mo_rel    = [win_start + r for r in rest_win_rel]
-        # Core and virtual positions in mo_ordered
-        core_mo_rel    = list(range(n_core))
-        virt_mo_rel    = list(range(win_start + len(window), mo_ordered.shape[1]))
+        # Top n_orb orbitals by entropy
+        active_rel = ent_rank[:n_orb].tolist()
 
-        # Build MO ordering for CASSCF:
-        # core (frozen) | active (QICAS top-n_orb) | inactive (rest of window + virt)
-        mo_cas_order   = core_mo_rel + active_mo_rel + rest_mo_rel + virt_mo_rel
-        mo_cas         = mo_ordered[:, mo_cas_order]
+        # Build MO matrix with these as active
+        mo_scan = build_scan_mo(mo_ord, window, active_rel, n_mo, mf)
 
-        # Verify electron count consistency
-        n_alpha = (n_elec_fixed + spin_2s) // 2
-        n_beta  = (n_elec_fixed - spin_2s) // 2
-        if n_orb < n_alpha:
-            print(f"  [SKIP] n_orb={n_orb} < n_alpha={n_alpha}, skipping")
-            continue
+        # CASCI with spin enforcement
+        t1 = time.time()
+        res = run_casci_noon(mf, mo_scan, n_orb, n_elec, spin_2s)
+        dt = time.time() - t1
 
-        # Run CASSCF
-        t0  = time.time()
-        mc  = mcscf.CASSCF(mf, n_orb, n_elec_fixed)
-        mc.max_cycle_macro = 100
-        mc.conv_tol        = 1e-8
-        mc.verbose         = 3
-        target_ss = spin_2s * (spin_2s + 2) / 4.0
-        mc.fix_spin_(ss=target_ss, shift=0.5)
-        # Enforce correct spin state — prevents AutoCAS-style spin collapse
-        target_ss = spin_2s * (spin_2s + 2) / 4.0
-        mc.fix_spin_(ss=target_ss, shift=0.5)
-        try:
-            e_cas = mc.kernel(mo_cas)[0]
-            converged = mc.converged
-        except Exception as exc:
-            print(f"  [ERROR] CASSCF failed: {exc}")
-            scan_data.append({"n_orb": n_orb, "n_elec": n_elec_fixed,
-                               "status": "FAILED", "error": str(exc)})
-            continue
-        t_cas = time.time() - t0
+        if res is not None:
+            res['time_s'] = dt
+            scan_results['results'][str(n_orb)] = res
+            noons = res['noons']
+            s2_str = f"  S²={res['s2']:.4f}" if res['s2'] is not None else ""
+            print(f"    ✓ E={res['energy']:.8f}  Tr(1-RDM)={res['tr_rdm1']:.4f}"
+                  f"{s2_str}  ({dt:.1f}s)")
+            # CONTEXT.md: "NOONs: all between 0 and 2"
+            noon_str = ' '.join(f'{x:.3f}' for x in noons[:min(8, len(noons))])
+            if len(noons) > 8:
+                noon_str += '...'
+            print(f"    NOONs: {noon_str}")
+        else:
+            print(f"    ✗ Skipping ({dt:.1f}s)")
 
-        # Extract NOONs from 1-RDM eigenvalues
-        dm1_cas = mc.fcisolver.make_rdm1(mc.ci, mc.ncas, mc.nelecas)            # shape (n_orb, n_orb), active-MO basis
-        noons_raw = np.linalg.eigvalsh(dm1_cas)  # eigenvalues
-        noons     = np.sort(noons_raw)[::-1]      # descending
+    n_ok = len(scan_results['results'])
+    scan_results['scan_sizes_completed'] = sorted(int(k) for k in scan_results['results'])
+    scan_results['n_completed'] = n_ok
+    print(f"\n  Phase 2 complete: {n_ok}/{len(scan_sizes)} sizes converged")
 
-        print(f"  E(CASSCF) = {e_cas:.8f}  converged={converged}  ({t_cas:.1f}s)")
-        print(f"  NOONs: {noons.round(4).tolist()}")
-        print(f"  Tr(1-RDM) = {noons.sum():.4f}  (should be {n_elec_fixed})")
-
-        scan_data.append({
-            "n_orb":     n_orb,
-            "n_elec":    n_elec_fixed,
-            "label":     f"({n_elec_fixed},{n_orb})",
-            "e_casscf":  float(e_cas),
-            "converged": bool(converged),
-            "noons":     noons.tolist(),
-            "t_s":       float(t_cas),
-            "status":    "OK",
-        })
-
-    with open(out_json, "w") as f:
-        json.dump({"name": name, "n_elec_fixed": n_elec_fixed,
-                   "n_qicas": n_qicas, "scan": scan_data}, f, indent=2)
-    print(f"\n  Saved → {out_json}")
-    return scan_data
+    return scan_results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 3 — Plot
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase 3: Plotting — Style matched to 10 screenshots
+# ═══════════════════════════════════════════════════════════════════════
 
-def make_plot(scan_json="scan_results.json", qicas_json="qicas_result.json",
-              out_prefix="noon_convergence", qicas_n_active_override=None):
+def plot_convergence(scan_results, qicas_result, plot_prefix):
+    """Generate two-panel NOON convergence plot.
+
+    Plot format verified against 10 screenshots (5 systems × 2 copies):
+
+    Top panel:
+      Title:  "NOON convergence — {name}"
+      X-axis: "Active space orbital index (sorted by NOON, desc)"
+      Y-axis: "NOON value"
+      Colors: Sequential red→yellow→green (RdYlGn), one per CAS size
+      Markers: cycle through o, s, ^, D, v
+      Lines:  dotted for all sizes
+      QICAS:  gray dashed vertical line at n_qicas
+      Legend: "(n_elec, n_orb)  ← QICAS" for the QICAS size
+
+    Bottom panel:
+      Title:  "QICAS single-orbital entropy profile"
+      X-axis: "Window orbital (entropy rank)"
+      Y-axis: "S(ρ_i)"
+      Bars:   steelblue
+      Cut:    red dashed vertical line, labeled "QICAS cut (n=X)"
     """
-    Reproduce the autoCAS-style NOON convergence figure.
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
 
-    Top panel  : one curve per active space size, NOON vs orbital index
-    Bottom panel: entropy profile from QICAS (reference)
-    """
-    with open(scan_json) as f:
-        scan = json.load(f)
-    with open(qicas_json) as f:
-        qr  = json.load(f)
+    name = scan_results['name']
+    n_elec = scan_results['n_elec']
+    n_qicas = scan_results['n_qicas']
+    ent_sorted = qicas_result['entropy_profile']['entropies_sorted_desc']
 
-    name      = scan["name"]
-    n_qicas   = scan.get("n_qicas") or scan.get("n_active_qicas") or scan.get("n_active") or 14
-    if qicas_n_active_override:
-        print(f"  [PLOT] n_qicas override: {n_qicas} → {qicas_n_active_override} (paper value)")
-        n_qicas = qicas_n_active_override
-    n_elec    = scan["n_elec_fixed"]
-    scan_data = [d for d in scan["scan"] if d["status"] == "OK"]
+    # Collect completed sizes in order
+    completed = {}
+    for n_orb_str, res in scan_results['results'].items():
+        completed[int(n_orb_str)] = res['noons']
+    sizes = sorted(completed.keys())
 
-    if not scan_data:
-        print("[WARN] No successful scan points to plot.")
+    if not sizes:
+        print("  ✗ No completed sizes to plot")
         return
 
-    n_sizes = len(scan_data)
+    n = len(sizes)
 
-    # Colour map: red for smallest → green for largest (matches original figures)
-    colours   = [cm.RdYlGn(i / max(n_sizes - 1, 1)) for i in range(n_sizes)]
-    markers   = ["o", "s", "^", "D", "v", "P", "*", "X"][:n_sizes]
-    linestyle = "dotted"
+    # ── Color scheme: sample RdYlGn colormap ─────────────────────────
+    # Verified from screenshots: smallest=dark red, middle=yellow, largest=dark green
+    cmap = plt.cm.RdYlGn
+    if n == 1:
+        colors = [cmap(0.5)]
+    else:
+        # Sample from 0.05 to 0.95 to avoid extreme ends
+        colors = [cmap(0.05 + 0.9 * i / (n - 1)) for i in range(n)]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 9),
-                                    gridspec_kw={"height_ratios": [3, 1.5]})
+    markers = ['o', 's', '^', 'D', 'v', 'P', 'X', 'h']
+    linestyles = [':'] * n  # all dotted (verified from screenshots)
+
+    # ── Figure layout (verified from screenshots: ~2:1 height ratio) ─
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(10, 10),
+        gridspec_kw={'height_ratios': [2, 1]},
+    )
     fig.subplots_adjust(hspace=0.35)
 
-    # ── Top panel: NOON convergence ──────────────────────────────────────────
-    ax1.set_title(f"NOON convergence — {name}", fontsize=11, pad=8)
-    for i, d in enumerate(scan_data):
-        noons = d["noons"]
-        xs    = np.arange(1, len(noons) + 1)
-        lbl   = d["label"]
-        if d["n_orb"] == n_qicas:
-            lbl += "  ← QICAS"
-        ax1.plot(xs, noons,
-                 linestyle=linestyle,
-                 marker=markers[i % len(markers)],
-                 color=colours[i],
-                 label=lbl,
-                 linewidth=1.4,
-                 markersize=6,
-                 zorder=3 + i)
+    # ── Top panel: NOON convergence ──────────────────────────────────
+    for idx, n_orb in enumerate(sizes):
+        noons = completed[n_orb]
+        x = np.arange(1, len(noons) + 1)
 
-    # Mark the QICAS recommendation size with a vertical dashed line
-    ax1.axvline(x=n_qicas, color="grey", linestyle="--", linewidth=0.8,
-                label=f"QICAS n_orb={n_qicas}", zorder=1)
-    # Mark occupation = 1.0 (SOMO plateau for high-spin)
-    ax1.axhline(y=1.0, color="black", linestyle=":", linewidth=0.6, alpha=0.5)
-    ax1.axhline(y=0.0, color="black", linestyle=":", linewidth=0.6, alpha=0.5)
+        label = f'({n_elec},{n_orb})'
+        if n_orb == n_qicas:
+            label += '  \u2190 QICAS'    # ← QICAS
 
-    ax1.set_xlabel("Active space orbital index (sorted by NOON, desc)", fontsize=10)
-    ax1.set_ylabel("NOON value", fontsize=10)
-    ax1.set_ylim(-0.05, 2.05)
-    ax1.set_xlim(0.5, max(d["n_orb"] for d in scan_data) + 0.5)
-    ax1.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    ax1.legend(fontsize=8, framealpha=0.85, loc="upper right")
-    ax1.grid(True, alpha=0.25)
+        ax1.plot(x, noons,
+                 linestyle=linestyles[idx],
+                 marker=markers[idx % len(markers)],
+                 color=colors[idx],
+                 markersize=7, linewidth=1.5,
+                 label=label, zorder=3)
 
-    # ── Bottom panel: QICAS entropy profile ──────────────────────────────────
-    ax2.set_title("QICAS single-orbital entropy profile", fontsize=10)
-    entropies = np.array(qr["entropies"])
-    ranked    = np.array(qr["entropy_ranked"])
-    ent_sorted = entropies[ranked]               # sorted descending
-    xs2       = np.arange(1, len(ent_sorted) + 1)
+    # QICAS vertical reference line
+    ax1.axvline(x=n_qicas, color='gray', linestyle='--', linewidth=1,
+                label=f'QICAS n_orb={n_qicas}', zorder=1)
 
-    ax2.bar(xs2, ent_sorted, color="steelblue", alpha=0.75, width=0.7)
-    ax2.axvline(x=n_qicas + 0.5, color="red", linestyle="--", linewidth=1.2,
-                label=f"QICAS cut (n={n_qicas})")
-    ax2.set_xlabel("Window orbital (entropy rank)", fontsize=10)
-    ax2.set_ylabel("S(ρ_i)", fontsize=10)
-    ax2.legend(fontsize=9)
-    ax2.grid(True, axis="y", alpha=0.3)
+    # Horizontal reference at NOON = 1.0
+    ax1.axhline(y=1.0, color='lightgray', linestyle='-', linewidth=0.5, zorder=0)
 
-    # ── Save ─────────────────────────────────────────────────────────────────
-    for ext in ("pdf", "png"):
-        fname = f"{out_prefix}.{ext}"
-        fig.savefig(fname, dpi=150, bbox_inches="tight")
-        print(f"  Saved → {fname}")
+    ax1.set_xlabel('Active space orbital index (sorted by NOON, desc)', fontsize=11)
+    ax1.set_ylabel('NOON value', fontsize=11)
+    ax1.set_title(f'NOON convergence \u2014 {name}', fontsize=13, fontweight='bold')
+    ax1.set_ylim(-0.05, 2.10)
+    ax1.grid(True, axis='y', alpha=0.3)
+    ax1.legend(loc='best', fontsize=9, framealpha=0.9)
+
+    # ── Bottom panel: QICAS entropy profile ──────────────────────────
+    n_ent = len(ent_sorted)
+    x_ent = np.arange(n_ent)
+
+    ax2.bar(x_ent, ent_sorted, color='steelblue', alpha=0.8, width=0.8)
+    ax2.axvline(x=n_qicas - 0.5, color='red', linestyle='--', linewidth=2,
+                label=f'QICAS cut (n={n_qicas})')
+
+    ax2.set_xlabel('Window orbital (entropy rank)', fontsize=11)
+    ax2.set_ylabel(r'$S(\rho_i)$', fontsize=11)
+    ax2.set_title('QICAS single-orbital entropy profile', fontsize=12)
+    ax2.set_ylim(0, max(ent_sorted) * 1.15 if ent_sorted else 1.0)
+    ax2.legend(loc='upper right', fontsize=10)
+
+    # ── Save ─────────────────────────────────────────────────────────
+    # Output files verified from .gitignore: noon_convergence.png, .pdf
+    png_path = f'{plot_prefix}.png'
+    pdf_path = f'{plot_prefix}.pdf'
+    fig.savefig(png_path, dpi=150, bbox_inches='tight')
+    fig.savefig(pdf_path, bbox_inches='tight')
     plt.close(fig)
+    print(f"\n  Plot saved: {png_path}")
+    print(f"  Plot saved: {pdf_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Utilities
+# ═══════════════════════════════════════════════════════════════════════
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--system",      default="V_Cl6_chg-2_spin3_oct_d2p394",
-                   help="System key in SYSTEMS dict (default: V_Cl6)")
-    p.add_argument("--skip-qicas",  action="store_true",
-                   help="Skip Phase 1, load existing qicas_result.json")
-    p.add_argument("--only-plot",   action="store_true",
-                   help="Skip Phases 1+2, replot from existing JSON files")
-    p.add_argument("--M",           type=int, default=100,
-                   help="DMRG bond dimension for QICAS (default: 100)")
-    p.add_argument("--n-below",     type=int, default=4,
-                   help="Scan n_qicas - n_below sizes (default: 4)")
-    p.add_argument("--n-above",     type=int, default=2,
-                   help="Scan n_qicas + n_above sizes (default: 2)")
-    p.add_argument("--max-orbs",    type=int, default=16,
-                   help="Hard cap on n_orb to avoid memory wall (default: 16)")
-    p.add_argument("--qicas-n-active", type=int, default=None,
-                   help="Override QICAS n_active from paper (shifts dashed line to match paper)")
-    p.add_argument("--scratch",     default="/tmp/noon_scan",
-                   help="DMRG scratch directory")
-    p.add_argument("--qicas-json",  default="qicas_result.json")
-    p.add_argument("--scan-json",   default="scan_results.json")
-    p.add_argument("--plot-prefix", default="noon_convergence")
-    return p.parse_args()
+def _json_safe(obj):
+    """Make numpy types JSON-serializable.
+    Source: qicas_canonical.py _j (lines 299-305)"""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return None if np.isnan(obj) else float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Main — CLI contract from setup_scan.py generate_slurm (lines 231-240)
+# ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    args = parse_args()
-    name = args.system
+    p = argparse.ArgumentParser(
+        description='NOON Convergence Scan for QICAS Active Space Validation')
 
-    if name not in SYSTEMS:
-        print(f"[ERROR] Unknown system '{name}'. Available: {list(SYSTEMS)}")
-        sys.exit(1)
-    s = SYSTEMS[name]
+    # Arguments exactly as generated by setup_scan.py generate_slurm
+    p.add_argument('--system_dict', type=str, required=True,
+                   help='JSON string with system definition')
+    p.add_argument('--skip-qicas', action='store_true',
+                   help='Skip Phase 1, load existing qicas-json')
+    p.add_argument('--M', type=int, default=100,
+                   help='DMRG bond dimension (ALWAYS 100)')
+    p.add_argument('--n-below', type=int, default=4,
+                   help='Sizes below QICAS to scan')
+    p.add_argument('--n-above', type=int, default=2,
+                   help='Sizes above QICAS to scan')
+    p.add_argument('--scratch', type=str,
+                   default='/scratch/hpc-prf-qehpc/hpcmual/dmrg_scratch/default',
+                   help='DMRG scratch directory')
+    p.add_argument('--qicas-json', type=str, required=True,
+                   help='Path for QICAS result JSON')
+    p.add_argument('--scan-json', type=str, required=True,
+                   help='Path for scan results JSON')
+    p.add_argument('--plot-prefix', type=str, required=True,
+                   help='Prefix for plot files (.png/.pdf appended)')
 
-    t_total = time.time()
+    args = p.parse_args()
 
-    # Phase 1
-    if args.only_plot:
-        print("[Skip] Phases 1+2 — loading existing JSON files")
-        with open(args.qicas_json) as f:
-            qr = json.load(f)
-    elif args.skip_qicas:
-        print("[Skip] Phase 1 — loading existing QICAS JSON")
-        with open(args.qicas_json) as f:
-            qr = json.load(f)
-    else:
-        qr = run_qicas(name, s,
-                       out_json=args.qicas_json,
-                       M=args.M,
-                       scratch=args.scratch)
+    # Parse the system dict passed as JSON string
+    system = json.loads(args.system_dict)
+    name = system.get('name', 'unknown')
+    spin_2s = system['spin_2s']
+    cat = spin_category(spin_2s)
+    params = DMRG_PARAMS[cat]
 
-    # Phase 2
-    if not args.only_plot:
-        run_casscf_scan(name, s, qr,
-                        out_json=args.scan_json,
-                        n_below=args.n_below,
-                        n_above=args.n_above,
-                        scratch=args.scratch,
-                        max_orbs=args.max_orbs)
-
-    # Phase 3
     print(f"\n{'='*60}")
-    print("  Phase 3 — Plotting")
+    print(f"  NOON Convergence Scan")
+    print(f"  System:  {name}")
+    print(f"  Spin:    2S={spin_2s} ({cat})")
+    print(f"  DMRG:    M={args.M}, window={params['window']}")
+    print(f"  Scan:    n_below={args.n_below}, n_above={args.n_above}")
+    print(f"  Scratch: {args.scratch}")
     print(f"{'='*60}")
-    make_plot(scan_json=args.scan_json,
-              qicas_json=args.qicas_json,
-              out_prefix=args.plot_prefix,
-              qicas_n_active_override=args.qicas_n_active)
 
-    print(f"\n  Total wall time: {time.time()-t_total:.1f}s")
-    print("  Done.")
+    # Ensure output directories exist
+    for path in [args.qicas_json, args.scan_json, args.plot_prefix]:
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    # ── Phase 1: QICAS ───────────────────────────────────────────────
+    if args.skip_qicas:
+        print(f"\n  --skip-qicas: Loading {args.qicas_json}")
+        with open(args.qicas_json) as f:
+            qicas_result = json.load(f)
+        print(f"  Loaded: CAS({qicas_result['n_elec_qicas']}, "
+              f"{qicas_result['n_active_qicas']})")
+    else:
+        sweeps = params['sweeps']
+        qicas_result = run_qicas_phase(
+            system, M=args.M, sweeps=sweeps, scratch=args.scratch)
+
+        # Save (strip internal PySCF objects)
+        qicas_save = {k: v for k, v in qicas_result.items()
+                      if not k.startswith('_')}
+        with open(args.qicas_json, 'w') as f:
+            json.dump(_json_safe(qicas_save), f, indent=2)
+        print(f"\n  Saved: {args.qicas_json}")
+
+    # ── Phase 2: NOON Scan ───────────────────────────────────────────
+    scan_results = run_noon_scan(
+        qicas_result, n_below=args.n_below, n_above=args.n_above)
+
+    with open(args.scan_json, 'w') as f:
+        json.dump(_json_safe(scan_results), f, indent=2)
+    print(f"\n  Saved: {args.scan_json}")
+
+    # ── Phase 3: Plot ────────────────────────────────────────────────
+    print("\n[Phase 3] Generating convergence plot...")
+    try:
+        plot_convergence(scan_results, qicas_result, args.plot_prefix)
+    except Exception as exc:
+        print(f"  ⚠ Plot generation failed: {exc}")
+        print("  (JSON results saved — plot can be regenerated)")
+        traceback.print_exc()
+
+    # ── Summary ──────────────────────────────────────────────────────
+    n_ok = scan_results.get('n_completed', 0)
+    n_att = len(scan_results.get('scan_sizes_attempted', []))
+    print(f"\n{'='*60}")
+    print(f"  Done — {name}")
+    print(f"  QICAS:  CAS({qicas_result['n_elec_qicas']}, "
+          f"{qicas_result['n_active_qicas']})")
+    print(f"  Scanned: {n_ok}/{n_att} sizes converged")
+    if n_ok < n_att:
+        ok = set(scan_results.get('scan_sizes_completed', []))
+        failed = [s for s in scan_results.get('scan_sizes_attempted', [])
+                  if s not in ok]
+        print(f"  Failed:  {failed}")
+    print(f"{'='*60}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
