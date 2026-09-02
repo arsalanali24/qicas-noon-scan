@@ -1,0 +1,19 @@
+{
+  "name": "Mn_Br4_chg-2_spin2_tet",
+  "metal": "Mn",
+  "ligand": "Br",
+  "charge": -2,
+  "spin_2s": 2,
+  "metal_row": "3d",
+  "M_dmrg": 100,
+  "geometry_source": "ideal_parametric",
+  "autocas_reference": {
+    "cas_ne": 0,
+    "cas_no": 0,
+    "note": "autoCAS M=150 result, stored for comparison only"
+  },
+  "status": "ERROR",
+  "error": "Electron number 167 and spin 2 are not consistent\nNote mol.spin = 2S = Nalpha - Nbeta, not 2S+1",
+  "traceback": "Traceback (most recent call last):\n  File \"/pc2/users/h/hpcmual/qicas_pipeline/scripts/qicas_casscf_benchmark.py\", line 778, in run_one_system\n    mol = build_mol(name, s, xyz_path=xyz_path)\n  File \"/pc2/users/h/hpcmual/qicas_pipeline/scripts/qicas_casscf_benchmark.py\", line 281, in build_mol\n    mol.build()\n    ~~~~~~~~~^^\n  File \"/pc2/users/h/hpcmual/envs/block2env/lib/python3.13/site-packages/pyscf/gto/mole.py\", line 2598, in build\n    self.nelec\n  File \"/pc2/users/h/hpcmual/envs/block2env/lib/python3.13/site-packages/pyscf/gto/mole.py\", line 2386, in nelec\n    raise RuntimeError('Electron number %d and spin %d are not consistent\\n'\n                       'Note mol.spin = 2S = Nalpha - Nbeta, not 2S+1' %\n                       (ne, self.spin))\nRuntimeError: Electron number 167 and spin 2 are not consistent\nNote mol.spin = 2S = Nalpha - Nbeta, not 2S+1\n",
+  "wall_time_s": 0.016864538192749023
+}

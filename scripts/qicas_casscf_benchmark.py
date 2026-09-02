@@ -287,6 +287,7 @@ def build_mol(name, s, xyz_path=None):
 def run_hf(mol, s):
     """Run UHF with robust convergence fallbacks. Returns mf object."""
     mf = scf.UHF(mol)
+    mf.init_guess = "atom"
     mf.max_cycle  = 500
     mf.conv_tol   = 1e-10
     mf.kernel()
@@ -426,7 +427,7 @@ def run_dmrg(mol, mf, window, n_elec_in_window, M=350, n_sweeps=50,
     mc.fcisolver.scratchDirectory  = scratch_dir
     mc.fcisolver.runtimeDir        = scratch_dir
     mc.fcisolver.maxIter           = n_sweeps
-    mc.fcisolver.block_extra_keyword = ['num_thrds 4']  # adjust for cluster
+    mc.fcisolver.block_extra_keyword = ['num_thrds 64']  # adjust for cluster
 
     # Explicitly set twodot_to_onedot to avoid block2 AssertionError:
     # block2 requires: len(schedule) > twodot_to_onedot
@@ -534,7 +535,7 @@ def qicas_orbital_rotation(gamma, Gamma, n_win, d_cas, max_iter=300, tol=1e-7):
         return val
 
     res = _minimize(_fqi, np.zeros(n * n), method='L-BFGS-B',
-                    options={'maxiter': max_iter, 'ftol': tol, 'gtol': tol * 0.1,
+                    options={"maxiter": max_iter, "ftol": 1e-5, "gtol": 1e-6, "maxls": 50,
                              'maxfun': max_iter * 20})
 
     X_opt = res.x.reshape(n, n); X_opt = (X_opt - X_opt.T) / 2
@@ -644,7 +645,12 @@ def run_casci(mol, mf, mo_hf, mo_qicas, n_active_e, n_active, label):
     CAS size.  Returns (e_hf, e_qicas, delta_mha).
     """
     def _casci_energy(mo_ref):
-        mc = mcscf.CASCI(mf.to_rhf(), n_active, n_active_e)
+        # Enforce minimum orbitals: n_active >= ceil(n_alpha) to avoid PySCF assertion
+        import math
+        n_alpha = (n_active_e + 1) // 2 if isinstance(n_active_e, int) else (n_active_e[0] + n_active_e[1])
+        n_alpha = n_active_e[0] if isinstance(n_active_e, tuple) else (n_active_e + 1) // 2
+        n_active_safe = max(n_active, n_alpha)
+        mc = mcscf.CASCI(mf.to_rhf(), n_active_safe, n_active_e)
         mc.verbose = 3
         e = mc.kernel(mo_ref)[0]
         return float(e)
@@ -659,7 +665,7 @@ def run_casci(mol, mf, mo_hf, mo_qicas, n_active_e, n_active, label):
 # ── CASSCF from two starting points (Goal 2) ─────────────────────────────
 
 def run_casscf_comparison(mol, mf, mo_hf, mo_qicas,
-                           n_active_e, n_active, max_macro=200):
+                           n_active_e, n_active, max_macro=200, name="system"):
     """
     Run CASSCF to convergence from both HF and QICAS starting orbitals.
     Returns dict with energies, iteration counts, and wall times.
@@ -669,9 +675,16 @@ def run_casscf_comparison(mol, mf, mo_hf, mo_qicas,
     for label, mo_start in [('from_hf', mo_hf), ('from_qicas', mo_qicas)]:
         t0 = time.time()
         mc = mcscf.CASSCF(mf.to_rhf(), n_active, n_active_e)
+        mc.fcisolver = dmrgci.DMRGCI(mol, maxM=350, tol=1e-8)
+        mc.fcisolver.scratchDirectory = os.path.join(os.environ.get("PYSCF_TMPDIR","/scratch/hpc-prf-qehpc/hpcmual/dmrg_scratch"), f"casscf_{label}_{name}")
+        mc.fcisolver.runtimeDir = mc.fcisolver.scratchDirectory
+        mc.fcisolver.maxIter = 30
+        mc.fcisolver.block_extra_keyword = ["num_thrds 64"]
+        mc.fcisolver.twodot_to_onedot = 15
+        os.makedirs(mc.fcisolver.scratchDirectory, exist_ok=True)
         mc.max_cycle_macro = max_macro
         mc.conv_tol        = 1e-9
-        mc.conv_tol_grad   = 1e-4   # relaxed: avoids oscillation near minimum
+        mc.conv_tol_grad   = 3e-4   # DMRG noise requires relaxed gradient tolerance
         mc.verbose         = 4
 
         # Count macro iterations by hooking into the callback
@@ -915,7 +928,7 @@ def run_one_system(name, s, M_dmrg=350, n_sweeps=50, out_dir='results',
         t0 = time.time()
         casscf_results = run_casscf_comparison(
             mol, mf, mo_hf_cas, mo_qicas_cas, n_active_e, n_active,
-            max_macro=100)
+            max_macro=400, name=name)
         t_casscf = time.time() - t0
 
         e_hf_casscf = casscf_results['from_hf']['e_casscf']

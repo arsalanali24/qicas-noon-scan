@@ -10,14 +10,55 @@
   "autocas_reference": {
     "cas_ne": 17,
     "cas_no": 10,
-    "note": "autoCAS M=150 result, stored for comparison only"
+    "M_bond_dim": 250,
+    "pre_fix_cas_ne": 17,
+    "pre_fix_cas_no": 10,
+    "spin_fix_applied": false,
+    "note": "autoCAS M=250 LargeCAS def2-SVP"
   },
   "status": "ERROR",
   "n_electrons": 95,
   "n_basis": 103,
-  "e_hf": -2987.3735054157287,
-  "t_hf_s": 19.29375433921814,
+  "e_hf": -2987.3735054156177,
+  "t_hf_s": 13.904887437820435,
+  "window": {
+    "size": 26,
+    "abs_indices": [
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62
+    ],
+    "n_elec": 21
+  },
   "error": "tuple index out of range",
-  "traceback": "Traceback (most recent call last):\n  File \"/pc2/users/h/hpcmual/qicas_pipeline/scripts/qicas_casscf_benchmark.py\", line 790, in run_one_system\n    window, n_elec_window = select_window(mf, s, window_size)\n                            ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/pc2/users/h/hpcmual/qicas_pipeline/scripts/qicas_casscf_benchmark.py\", line 345, in select_window\n    n_mo    = mf.mo_occ[0].shape[0]   # alpha MOs\n              ~~~~~~~~~~~~~~~~~~^^^\nIndexError: tuple index out of range\n",
-  "wall_time_s": 19.305315017700195
+  "traceback": "Traceback (most recent call last):\n  File \"/pc2/users/h/hpcmual/qicas_pipeline/scripts/qicas_casscf_benchmark.py\", line 815, in run_one_system\n    mc_dmrg, e_dmrg, mo_ordered = run_dmrg(\n                                  ~~~~~~~~^\n        mol, mf, window, n_elec_window,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        M=M_dmrg, n_sweeps=n_sweeps,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        scratch_dir=scratch, name=name)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/pc2/users/h/hpcmual/qicas_pipeline/scripts/qicas_casscf_benchmark.py\", line 398, in run_dmrg\n    n_mo  = mo_ref.shape[1]\n            ~~~~~~~~~~~~^^^\nIndexError: tuple index out of range\n",
+  "wall_time_s": 13.946385383605957,
+  "comparison_with_autocas": {
+    "autocas_no": 10,
+    "autocas_ne": 17,
+    "delta_no": 4
+  }
 }
