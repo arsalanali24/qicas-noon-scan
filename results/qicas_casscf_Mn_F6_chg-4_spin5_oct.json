@@ -8,9 +8,13 @@
   "M_dmrg": 100,
   "geometry_source": "ideal_parametric",
   "autocas_reference": {
-    "cas_ne": 0,
-    "cas_no": 0,
-    "note": "autoCAS M=150 result, stored for comparison only"
+    "cas_ne": 17,
+    "cas_no": 11,
+    "M_bond_dim": 250,
+    "pre_fix_cas_ne": 14,
+    "pre_fix_cas_no": 8,
+    "spin_fix_applied": true,
+    "note": "autoCAS M=250 LargeCAS def2-SVP; spin-consistency fix applied"
   },
   "status": "OK",
   "n_electrons": 83,
@@ -211,9 +215,9 @@
   "comparison_with_autocas": {
     "qicas_no": 13,
     "qicas_ne": 21,
-    "autocas_no": 0,
-    "autocas_ne": 0,
-    "delta_no": 13,
+    "autocas_no": 11,
+    "autocas_ne": 17,
+    "delta_no": 2,
     "delta_ne": 21,
     "note": "autoCAS used as post-hoc reference only \u2014 not fed to QICAS"
   },

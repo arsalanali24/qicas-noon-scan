@@ -1,0 +1,16 @@
+{
+  "metal": "Mo",
+  "ligand": "CO",
+  "charge": 0,
+  "spin_2s": 0,
+  "geometry": "oct",
+  "xyz_file": "xyz_files/08_Mo_CO6.xyz",
+  "n_ligands": 6,
+  "M": 100,
+  "sweeps": 35,
+  "window_size": 22,
+  "spin_cat": "low",
+  "_time": "06:00:00",
+  "_mem": "32G",
+  "name": "Mo_CO6_chg+0_spin0_oct"
+}

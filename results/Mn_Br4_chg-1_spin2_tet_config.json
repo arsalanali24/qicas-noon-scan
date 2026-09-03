@@ -4,7 +4,7 @@
   "charge": -1,
   "spin_2s": 2,
   "geometry": "tet",
-  "dist_ang": 2.5,
+  "dist_ang": 2.508,
   "n_ligands": 4,
   "M": 100,
   "sweeps": 30,

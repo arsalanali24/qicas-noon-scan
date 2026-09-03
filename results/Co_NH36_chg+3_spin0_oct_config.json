@@ -1,0 +1,16 @@
+{
+  "metal": "Co",
+  "ligand": "NH3",
+  "charge": 3,
+  "spin_2s": 0,
+  "geometry": "oct",
+  "xyz_file": "xyz_files/02_Co_NH3_6_3+.xyz",
+  "n_ligands": 6,
+  "M": 100,
+  "sweeps": 35,
+  "window_size": 22,
+  "spin_cat": "low",
+  "_time": "06:00:00",
+  "_mem": "32G",
+  "name": "Co_NH36_chg+3_spin0_oct"
+}

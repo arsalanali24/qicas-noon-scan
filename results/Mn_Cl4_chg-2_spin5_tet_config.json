@@ -5,10 +5,6 @@
   "spin_2s": 5,
   "geometry": "tet",
   "dist_ang": 2.35,
-  "autocas_reference": {
-    "ne": 17,
-    "no": 10
-  },
   "n_ligands": 4,
   "M": 100,
   "sweeps": 30,

@@ -1,0 +1,16 @@
+{
+  "metal": "Pd",
+  "ligand": "Br",
+  "charge": -2,
+  "spin_2s": 0,
+  "geometry": "sqpl",
+  "n_ligands": 4,
+  "xyz_file": "xyz_files/09_Pd_Br4_2-.xyz",
+  "M": 100,
+  "sweeps": 35,
+  "window_size": 22,
+  "spin_cat": "low",
+  "_time": "06:00:00",
+  "_mem": "32G",
+  "name": "Pd_Br4_chg-2_spin0_sqpl"
+}

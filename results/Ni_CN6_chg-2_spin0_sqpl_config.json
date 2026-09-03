@@ -1,0 +1,16 @@
+{
+  "metal": "Ni",
+  "ligand": "CN",
+  "charge": -2,
+  "spin_2s": 0,
+  "geometry": "sqpl",
+  "xyz_file": "xyz_files/03_Ni_CN4_2-.xyz",
+  "n_ligands": 6,
+  "M": 100,
+  "sweeps": 35,
+  "window_size": 22,
+  "spin_cat": "low",
+  "_time": "06:00:00",
+  "_mem": "32G",
+  "name": "Ni_CN6_chg-2_spin0_sqpl"
+}
