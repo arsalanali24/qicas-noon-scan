@@ -273,8 +273,10 @@ def build_mol(name, s, xyz_path=None):
     mol.unit     = 'angstrom'
     mol.symmetry = False          # avoid symmetry complications
 
-    # ECP for 4d metals — critical: without this PySCF runs all-electron
-    if s['metal_row'] == '4d':
+    # ECP for 4d/5d metals — critical: without this PySCF runs all-electron
+    _4D = {'Y','Zr','Nb','Mo','Tc','Ru','Rh','Pd','Ag','Cd'}
+    _5D = {'Hf','Ta','W','Re','Os','Ir','Pt','Au','Hg'}
+    if s['metal_row'] in ('4d','5d') or s.get('metal') in (_4D | _5D):
         mol.ecp = {s['metal']: 'def2-svp'}   # correct — metal only
 
     mol.verbose = 4
